@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.dev-handoff-local/
+.cache/
+dist/
+.dev-handoff.json
+.agents/
+.claude/
+node_modules/
+skills-lock.json
+.DS_Store

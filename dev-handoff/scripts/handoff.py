@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Complete dev-handoff CLI backed exclusively by personal Tencent Docs accounts."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+from handoff_core import Git, HandoffError, State, exclusive_lock, read_json, requirement
+from tencent_mcp import TencentMCP, load_token, local_directory, prepare_directory
+from tencent_tables import identity as live_identity, bind, create, tables, join
+from workflow import Workflow
+
+
+def parser():
+    p = argparse.ArgumentParser(description="dev-handoff：腾讯文档个人账号开发对接")
+    p.add_argument("--repo", default=".", help="当前开发仓库；所有 Git 操作均只读")
+    p.add_argument("--state-dir", help="个人恢复目录，默认仓库的 .dev-handoff-local/state")
+    p.add_argument("--table", help="当前项目绑定的表名、别名、Base ID 或完整 URL")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("doctor", help="检查依赖、账号和本人资料；不启动登录")
+    sub.add_parser("identity", help="查看当前 Token 对应的个人账号")
+    member = sub.add_parser("join", help="登记本人账号；分工可选，不限制任务领取")
+    member.add_argument("--role", help="成员分工；未配置选项时可自由填写或留空")
+    sub.add_parser("members", help="只读列出已登记的共享项目成员")
+    sub.add_parser("access", help="只读核对文档分享策略；指定成员编辑权限由分享面板设置")
+    claim = sub.add_parser("claim", help="领取一条未分配、依赖已完成的工单")
+    claim.add_argument("record_id")
+    claim.add_argument("--requirement", required=True)
+    assign = sub.add_parser("assign", help="发布方将一条待对接工单分配给已登记成员")
+    assign.add_argument("record_id")
+    assign.add_argument("--user-id", required=True)
+    assign.add_argument("--requirement", required=True)
+    cap = sub.add_parser("capture", help="读取暂存区快照和差异，不写入任何暂存文件")
+    cap.add_argument("--output", help="将 JSON 上下文写到明确指定的本地文件")
+    cap.add_argument("--paths", nargs="+")
+    idx = sub.add_parser("index-file", help="读取文件的暂存版本")
+    idx.add_argument("path")
+    sub.add_parser("tables", help="列出当前项目绑定的工单表")
+    c = sub.add_parser("create", help="创建并绑定工单表")
+    c.add_argument("name")
+    c.add_argument("--alias")
+    c.add_argument("--roles", nargs="+", help="可选的成员分工选项，如 前端 后端 测试；默认自由填写或留空")
+    sub.add_parser("layout", help="精简默认表头；隐藏内部字段，保留全部数据")
+    b = sub.add_parser("bind", help="检查并绑定已有 AI 表格")
+    b.add_argument("url")
+    b.add_argument("alias")
+    b.add_argument("--repair", action="store_true", help="显式同意补齐缺失字段和必要数据表，保留既有数据")
+    pub = sub.add_parser("publish", help="发布 AI 整理后的草稿 JSON")
+    pub.add_argument("draft_file")
+    sub.add_parser("queue", help="只读扫描当前用户的队列")
+    show = sub.add_parser("show", help="查看工单内容和需求指纹")
+    show.add_argument("record_id")
+    start = sub.add_parser("start", help="开始单条任务；成功后才允许编辑代码")
+    start.add_argument("record_id")
+    start.add_argument("--paths", nargs="+", required=True)
+    start.add_argument("--requirement", required=True)
+    extend = sub.add_parser("extend", help="编辑更多文件前声明并检查新增范围")
+    extend.add_argument("record_id")
+    extend.add_argument("--paths", nargs="+", required=True)
+    ready = sub.add_parser("ready", help="验证结果并提交待验收，不自动处理下一条")
+    ready.add_argument("record_id")
+    ready.add_argument("result_file")
+    ready.add_argument("--revalidate", action="store_true")
+    block = sub.add_parser("block", help="追加阻塞备注并停止当前任务")
+    block.add_argument("record_id")
+    block.add_argument("--reason", required=True)
+    block.add_argument("--attempted", required=True)
+    block.add_argument("--needed", required=True)
+    review = sub.add_parser("review", help="只读核对需求、代码证据和结果版本")
+    review.add_argument("record_id")
+    accept = sub.add_parser("accept", help="仅在操作者明确验收通过后调用")
+    accept.add_argument("record_id")
+    accept.add_argument("--confirmed-version", required=True)
+    reject = sub.add_parser("reject", help="操作者退回待验收工单")
+    reject.add_argument("record_id")
+    reject.add_argument("--reason", required=True)
+    resume = sub.add_parser("resume", help="明确解除阻塞，恢复到待对接")
+    resume.add_argument("record_id")
+    resume.add_argument("--reason", required=True)
+    sub.add_parser("sync", help="回读并恢复上次未完整确认的工单写入和日志")
+    abandon = sub.add_parser("abandon-operation", help="仅在操作者明确要求时放弃本地恢复尝试，保留记录且不改远端")
+    abandon.add_argument("operation_id")
+    abandon.add_argument("--reason", required=True)
+    return p
+
+
+def execute(args):
+    git = Git(args.repo)
+    state_dir = args.state_dir or (prepare_directory(git.root) / "state")
+    state = State(git, state_dir)
+    # Even read-only state loads take the local lock to avoid selecting stale checkpoints.
+    with exclusive_lock(state.lock_path):
+        state = State(git, state_dir)
+        if args.command == "capture":
+            context = git.staged_context(args.paths)
+            if args.output:
+                from handoff_core import write_json
+                write_json(args.output, context)
+                return {"snapshot": context["snapshot"], "output": str(Path(args.output).resolve())}
+            return context
+        if args.command == "index-file":
+            return {"path": args.path, "content": git.index_file(args.path)}
+        if args.command == "tables":
+            return {"bindings": state.project["bindings"]}
+        client = TencentMCP(load_token(git.root))
+        identity = live_identity(client)
+        if args.command in ("doctor", "identity"):
+            return {"identity": identity, "role": state.data["identities"].get(identity["profile"], {}).get("role"),
+                    "git": {"root": str(git.root), "head": git.head()}, "live_identity_verified": True}
+        if args.command == "create":
+            return create(client, state, identity, args.name, args.alias or args.name, args.roles)
+        if args.command == "bind":
+            return {"bound": bind(client, state, identity, args.url, args.alias, args.repair)}
+        binding = state.select(args.table)
+        if binding.get("provider") != "tencent":
+            raise HandoffError("legacy_binding", "此绑定尚未迁移到腾讯文档，请绑定腾讯智能表；旧表不会被删除。")
+        if args.command == "access":
+            access = client.call("manage.get_privilege", {"file_id": binding["base_id"]})
+            return {"url": binding["url"], "policy": access.get("policy"),
+                    "next": "在腾讯文档分享面板将指定同事添加为可编辑；请勿共享 Token。"}
+        if args.command == "layout":
+            from tencent_layout import clean_layout
+            return clean_layout(client, binding)
+        tickets, logs, members = tables(client, binding, identity)
+        if args.command == "join":
+            return join(members, state, identity, args.role)
+        roster = [r for r in members.records() if r.get("账号ID")]
+        if args.command == "members":
+            return {"members": roster, "url": binding["url"]}
+        current = [r for r in roster if r["账号ID"] == identity["user_id"]]
+        if len(current) != 1:
+            raise HandoffError("join_required", "请先用本人账号 join 登记为共享成员；分工可选。")
+        flow = Workflow(git, state, identity, binding, tickets, logs)
+        command = args.command
+        if command == "queue":
+            return {**flow.queue(), "claimable": flow.claimable()}
+        if command == "show":
+            row = tickets.get(args.record_id)
+            return {"record": row, "requirement_version": requirement(row)}
+        if command == "claim":
+            return flow.claim(args.record_id, args.requirement)
+        if command == "assign":
+            target = [r for r in roster if r["账号ID"] == args.user_id]
+            if len(target) != 1:
+                raise HandoffError("choose_member", "请选择成员表中唯一的账号 ID。")
+            return flow.assign(args.record_id, {"user_id": args.user_id}, args.requirement)
+        if command == "publish":
+            return flow.publish(read_json(args.draft_file))
+        if command == "start":
+            return flow.start(args.record_id, args.paths, args.requirement)
+        if command == "extend":
+            return flow.extend(args.record_id, args.paths)
+        if command == "ready":
+            return flow.ready(args.record_id, read_json(args.result_file), args.revalidate)
+        if command == "block":
+            return flow.block(args.record_id, args.reason, args.attempted, args.needed)
+        if command == "review":
+            row = tickets.get(args.record_id)
+            flow._check_review(row, row.get("结果版本"))
+            return {"record_id": row["id"], "summary": row["处理结果"], "result_version": row["结果版本"],
+                    "code_and_requirements_current": True, "next": "等待操作者明确验收，此检查不能代替人工通过。"}
+        if command == "accept":
+            return flow.accept(args.record_id, args.confirmed_version)
+        if command == "reject":
+            return flow.reject(args.record_id, args.reason)
+        if command == "resume":
+            return flow.resume(args.record_id, args.reason)
+        if command == "sync":
+            return {"recovered": flow.sync()}
+        if command == "abandon-operation":
+            return flow.abandon_operation(args.operation_id, args.reason)
+        raise HandoffError("invalid_command", "未支持的操作。")
+
+
+def main():
+    try:
+        result = execute(parser().parse_args())
+        print(json.dumps({"ok": True, "data": result}, ensure_ascii=False, indent=2))
+        return 0
+    except HandoffError as exc:
+        print(json.dumps({"ok": False, "error": {"code": exc.code, "message": exc.message,
+                                                 **exc.details}}, ensure_ascii=False, indent=2))
+        return 2
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        # Fail closed on malformed files/API shapes without dumping source/credentials.
+        print(json.dumps({"ok": False, "error": {"code": "invalid_input_or_response",
+                          "message": "输入文件或远端结构不符合契约，请检查对应 JSON 和命令 Schema。",
+                          "exception": type(exc).__name__}}, ensure_ascii=False))
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

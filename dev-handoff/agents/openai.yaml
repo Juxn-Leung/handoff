@@ -1,0 +1,4 @@
+interface:
+  display_name: "开发对接"
+  short_description: "用腾讯文档个人账号共享开发工单，发布暂存改动、逐条领取处理并由操作者验收"
+  default_prompt: "使用 $dev-handoff 查看当前项目的对接工单并处理一条。"
