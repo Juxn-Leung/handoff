@@ -11,7 +11,7 @@ description: "用腾讯文档个人 QQ／微信账号管理开发对接：共享
 
 日常业务单支持 AI 按表中标准执行验收 → 按指定验收人的授权确认或退回 → 原处理方回写。指定验收人说“验收工单 ID”即授权本轮按默认规则处理：全部通过就确认，有明确失败就退回并记录原因，没有失败但存在无法验证项则列出原因、保持待验收。无需补充长指令或重复批准；“只检查，不回写”明确限制为检查报告，不执行 confirm／reject／accept。“验收通过”仍用于确认已核对的结果。只有操作者明确要求双账号协议联调时，才走下述测试流程，不因双方使用不同账号就自动执行“确认后主动退回”或将测试确认用于业务验收。
 
-真实双账号联调使用 acceptance.md 的分阶段 acceptance_dual.py：指定同事在本人电脑执行，处理方回读其真实确认与退回记录后推进。支持更新已安装技能后从共享工单准备本地公开计划，无须转交 zip；运行脚本指纹必须与工单一致，不能绕过版本保护。不把模拟测试或单账号演练记成双账号通过。当前验证范围见 [validation.md](references/validation.md)。
+真实双账号联调分两种：退回重提使用 acceptance.md 的 acceptance_dual.py；**自动回写联调使用 [acceptance-auto.md](references/acceptance-auto.md) 的 acceptance_auto.py**，指定同事实际检查后确认，原工作区后台完成，最后只读核验。两者均须由同事在本人电脑执行；支持更新已安装技能后读取共享公开计划，运行指纹必须一致，不能绕过版本保护。不把模拟测试或单账号演练记成双账号通过。当前验证范围见 [validation.md](references/validation.md)。
 
 ## 命令入口
 
@@ -25,6 +25,8 @@ description: "用腾讯文档个人 QQ／微信账号管理开发对接：共享
 | 加入／登记分工 | 本人授权后 `join`；可选 `--role 自定义分工` |
 | 查看成员 | members，列出共享表中的稳定账号 ID、昵称和可选分工 |
 | 双账号联调 工单ID 第一轮／第二轮 | 读 acceptance.md 的“更新已安装技能后继续联调”，从指定共享表准备本人本地计划，调用 reviewer-first／reviewer-second；先核对真实账号、测试标记和脚本指纹 |
+| 自动回写联调 工单ID | 读 acceptance-auto.md；指定验收人执行 acceptance_auto.py reviewer，按本轮可信夹具实际检查并确认，失败则退回；无法验证则停止并报告 |
+| 查看自动回写联调结果 工单ID | 原处理端定位本轮 run-dir，用冻结 acceptance_auto.py audit 只读核验；不调用 accept／sync 或手动 worker step |
 | 查看分享权限 | access，只读核对策略并引导在腾讯文档邀请指定同事 |
 | 发布 [表名] | capture → 分析暂存内容 → 草稿 JSON → publish |
 | 查看 [表名] [应用] | queue，默认精简分页；`--app 应用` 筛选，详情用 show／review |

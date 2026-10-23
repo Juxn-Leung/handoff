@@ -152,6 +152,8 @@ python3 "$SKILL_DIR/scripts/acceptance_smoke.py" --repo "$REPO" --run-dir /本�
 
 ## 真实双账号分阶段联调
 
+本节验证退回与重提。验证“确认后后台自动完成”请使用独立的 [自动回写联调](acceptance-auto.md)，不要混用本节的主动退回或手动回写步骤。
+
 `scripts/acceptance_dual.py` 供两个已登记、可访问同一表的真实账号在各自电脑分阶段执行。处理方 prepare 创建单独标记的测试工单、执行真实夹具验证，并尝试由非指定账号确认，预期拒绝为 not_reviewer。它生成不含凭据、Git 数据或私有恢复状态的 zip 联调包，冻结运行代码和指纹。同事也可以更新已安装技能后按下一节从共享表准备公开计划；两端运行脚本指纹仍必须一致。
 
 ```sh
