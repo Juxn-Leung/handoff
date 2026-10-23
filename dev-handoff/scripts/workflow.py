@@ -111,6 +111,16 @@ class Workflow:
                 item["next"] = "review 查看逐项材料；明确通过指定版本后 confirm"
             else:
                 item["next"] = "等待指定验收人 review / confirm 本结果版本"
+            job = self.state.data.get("auto_accept", {}).get(digest([self.key(row["id"]), row.get("结果版本")]))
+            if job and job["profile"] == self.identity["profile"]:
+                from auto_accept import running
+                item["auto_accept"] = {"status": job["status"], "reason": job["reason"],
+                                       "worker_running": running(self.state, job["id"])}
+                if job["status"] == "waiting":
+                    item["next"] = ("原工作区自动回写进程等待完整确认及依赖就绪" if item["auto_accept"]["worker_running"]
+                                    else "原工作区执行 auto-accept 恢复已启用的自动回写")
+                else:
+                    item["next"] = "auto-accept --status 查看停止原因，排查后恢复或重新验证提交"
         except HandoffError as exc:
             item["acceptance_status"] = "needs_review"
             item["block_reason"] = shortened(item["block_reason"] + "；" + exc.message)
@@ -270,9 +280,11 @@ class Workflow:
             raise
         return updated
 
-    def sync(self):
+    def sync(self, operation_ids=None):
         results = []
         for op in self._pending_operations():
+            if operation_ids is not None and op["id"] not in operation_ids:
+                continue
             if op["profile"] != self.identity["profile"]:
                 raise HandoffError("identity_mismatch", "待恢复写入属于另一个账号。")
             if op.get("kind") == "acceptance_confirmation":
@@ -479,7 +491,7 @@ class Workflow:
         self.state.save()
         return {"record_id": rid, "paths": session["paths"]}
 
-    def ready(self, rid, result, revalidate=False):
+    def ready(self, rid, result, revalidate=False, auto_accept=False):
         self._guard_clean()
         if revalidate:
             row, session = self.tickets.get(rid), self.session(rid)
@@ -518,7 +530,8 @@ class Workflow:
                              "reviewer_id": delivery["reviewer_id"],
                              "acceptance": acceptance_materials(delivery, checks, result.get("acceptance"))})
         version = digest({k: v for k, v in evidence.items() if k != "verified_at"})
-        session = {**session, "phase": "pending_acceptance", "result_version": version}
+        session = {**session, "phase": "pending_acceptance", "result_version": version,
+                   "auto_accept": bool(delivery and auto_accept)}
         patch = {"状态": "待验收", "处理结果": result["summary"] + "\n\n验证：\n" + json.dumps(checks, ensure_ascii=False, indent=2),
                  "结果版本": version, "_结果证据": json.dumps(evidence, ensure_ascii=False)}
         self._apply(row, patch, "提交待验收", "结果版本：" + version + "\n" + patch["处理结果"], session=session, set_last=True)
@@ -652,7 +665,7 @@ class Workflow:
             self.state.save()
             raise
         return {"confirmed": rid, "result_version": confirmed_version, "reviewer_id": self.identity["user_id"],
-                "event_key": key, "stop": True, "next": "业务逐项确认已记录；仍待原处理账号在原工作区复核代码并 accept 回写。"}
+                "event_key": key, "stop": True, "next": "业务确认已记录；等待原工作区已启用的自动回写，或由原处理账号 accept。尚不能报告已完成。"}
 
     def review(self, rid):
         row = self.tickets.get(rid)

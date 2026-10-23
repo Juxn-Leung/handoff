@@ -72,6 +72,15 @@ def parser():
     ready.add_argument("record_id")
     ready.add_argument("result_file")
     ready.add_argument("--revalidate", action="store_true")
+    ready.add_argument("--manual-accept", action="store_true", help="本轮仅提交待验收，不启用确认后的本机自动回写")
+    auto = sub.add_parser("auto-accept", help="原工作区启用、恢复、查看或停止自动回写；省略 ID 时恢复已启用事项")
+    auto.add_argument("record_id", nargs="?")
+    mode = auto.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true", help="只读查看本机任务及进程是否运行")
+    mode.add_argument("--stop", action="store_true", help="停止指定工单的本机自动回写，不修改远端")
+    for name in ("_auto-accept-worker", "_auto-accept-step"):
+        internal = sub.add_parser(name, help=argparse.SUPPRESS)
+        internal.add_argument("job_id")
     block = sub.add_parser("block", help="追加阻塞备注并停止当前任务")
     block.add_argument("record_id")
     block.add_argument("--reason", required=True)
@@ -86,7 +95,7 @@ def parser():
     confirm.add_argument("record_id")
     confirm.add_argument("confirmation_file")
     confirm.add_argument("--confirmed-version", required=True)
-    accept = sub.add_parser("accept", help="仅在操作者明确验收通过后调用")
+    accept = sub.add_parser("accept", help="原工作区复核指定验收人的同版本完整确认并回写")
     accept.add_argument("record_id")
     accept.add_argument("--confirmed-version", required=True)
     reject = sub.add_parser("reject", help="操作者退回待验收工单")
@@ -104,7 +113,7 @@ def parser():
     return p
 
 
-def execute(args):
+def _execute(args):
     git = Git(args.repo)
     state_dir = args.state_dir or (prepare_directory(git.root) / "state")
     state = State(git, state_dir)
@@ -122,6 +131,10 @@ def execute(args):
             return {"path": args.path, "content": git.index_file(args.path)}
         if args.command == "tables":
             return {"bindings": state.project["bindings"]}
+        if args.command == "auto-accept" and args.status:
+            from auto_accept import status
+            binding = state.select(args.table)
+            return {"auto_accept": status(state, binding["base_id"] + ":" + binding["table_id"], args.record_id)}
         client = TencentMCP(load_token(git.root))
         identity = live_identity(client)
         if args.command in ("doctor", "identity"):
@@ -152,6 +165,18 @@ def execute(args):
             raise HandoffError("join_required", "请先用本人账号 join 登记为共享成员；分工可选。")
         flow = Workflow(git, state, identity, binding, tickets, logs, members)
         command = args.command
+        if command == "_auto-accept-step":
+            from auto_accept import step
+            return step(flow, args.job_id)
+        if command == "auto-accept":
+            from auto_accept import cancel, enable
+            if args.stop:
+                if not args.record_id:
+                    raise HandoffError("record_required", "停止自动回写需要工单 ID。")
+                return cancel(flow, args.record_id)
+            if args.record_id:
+                enable(flow, args.record_id)
+            return _schedule_auto_accept(flow, state_dir, {})
         if command == "queue":
             return flow.queue(args.app, args.limit, args.offset)
         if command == "show":
@@ -182,7 +207,9 @@ def execute(args):
         if command == "extend":
             return flow.extend(args.record_id, args.paths)
         if command == "ready":
-            return flow.ready(args.record_id, read_json(args.result_file), args.revalidate)
+            result = flow.ready(args.record_id, read_json(args.result_file), args.revalidate,
+                                auto_accept=not args.manual_accept)
+            return _schedule_auto_accept(flow, state_dir, result)
         if command == "block":
             return flow.block(args.record_id, args.reason, args.attempted, args.needed,
                               args.kind, args.waiting_for, args.paths)
@@ -197,10 +224,33 @@ def execute(args):
         if command == "resume":
             return flow.resume(args.record_id, args.reason)
         if command == "sync":
-            return {"recovered": flow.sync()}
+            return _schedule_auto_accept(flow, state_dir, {"recovered": flow.sync()})
         if command == "abandon-operation":
             return flow.abandon_operation(args.operation_id, args.reason)
         raise HandoffError("invalid_command", "未支持的操作。")
+
+
+def _schedule_auto_accept(flow, state_dir, result):
+    from auto_accept import register, status
+    active = register(flow)
+    result["auto_accept"] = [{k: v for k, v in item.items() if k != "worker_running"}
+                             for item in status(flow.state, flow.namespace)]
+    result["_launch"] = {"repo": str(flow.git.root), "state_dir": str(Path(state_dir).resolve()), "jobs": active}
+    return result
+
+
+def execute(args):
+    if args.command == "_auto-accept-worker":
+        from auto_accept import worker
+        step_args = argparse.Namespace(**{**vars(args), "command": "_auto-accept-step"})
+        return worker(step_args, _execute)
+    result = _execute(args)
+    launch = result.pop("_launch", None)
+    if launch:
+        from auto_accept import launch as launch_worker
+        # Release the workspace operation lock before starting/waiting for workers.
+        result["auto_accept_workers"] = [launch_worker(launch["repo"], launch["state_dir"], job) for job in launch["jobs"]]
+    return result
 
 
 def main():

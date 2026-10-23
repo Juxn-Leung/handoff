@@ -125,7 +125,8 @@ class TencentWorkflowTests(RepositoryCase):
         rid = self.publish_one()
         def run(*args):
             parsed = parser().parse_args(["--repo", str(self.frontroot), "--state-dir", str(Path(self.tmp.name) / "frontend-state"), *args])
-            with patch("handoff.TencentMCP", return_value=self.frontend), patch("handoff.load_token", return_value="offline-test"):
+            with patch("handoff.TencentMCP", return_value=self.frontend), patch("handoff.load_token", return_value="offline-test"), \
+                 patch("auto_accept.launch", return_value={"worker": "not_started_offline_test"}):
                 return execute(parsed)
         shown = run("show", rid)
         self.assertEqual(shown["delivery"]["checks"][0]["owner"], "接手方")
@@ -167,7 +168,8 @@ class TencentWorkflowTests(RepositoryCase):
         rid = self.bflow.publish(draft)["published"][0]["id"]
         def run(client, root, state_dir, *args):
             parsed = parser().parse_args(["--repo", str(root), "--state-dir", str(state_dir), *args])
-            with patch("handoff.TencentMCP", return_value=client), patch("handoff.load_token", return_value="offline-test"):
+            with patch("handoff.TencentMCP", return_value=client), patch("handoff.load_token", return_value="offline-test"), \
+                 patch("auto_accept.launch", return_value={"worker": "not_started_offline_test"}):
                 return execute(parsed)
         def front(*args):
             return run(self.frontend, self.frontroot, Path(self.tmp.name) / "frontend-state", *args)
