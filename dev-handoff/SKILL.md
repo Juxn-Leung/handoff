@@ -7,7 +7,9 @@ description: "用腾讯文档个人 QQ／微信账号管理开发对接：共享
 
 支持 Codex `$dev-handoff` 和 Claude Code `/dev-handoff`。完整流程使用腾讯文档个人账号和官方 MCP；运行环境为 Python 3.10+、Git 和可访问腾讯文档的网络。
 
-给同事上手时提供[中文使用说明](使用说明.md)。首次安装、授权和双账号共享读 [setup.md](references/setup.md)；处理读 [processing.md](references/processing.md)；逐项验收、退回和原工作区回写读 [acceptance.md](references/acceptance.md)；发布暂存区读 [publishing.md](references/publishing.md)。
+给同事上手时提供[中文使用说明](使用说明.md)，其中第 5 节有双方可直接复制的日常业务话术，以及业务验收与双账号联调的区别。首次安装、授权和双账号共享读 [setup.md](references/setup.md)；处理读 [processing.md](references/processing.md)；逐项验收、退回和原工作区回写读 [acceptance.md](references/acceptance.md)；发布暂存区读 [publishing.md](references/publishing.md)。
+
+日常业务单走人工审阅 → 指定验收人确认 → 原处理方回写；有实际问题才退回。只有操作者明确要求双账号协议联调时，才走下述测试流程，不因双方使用不同账号就自动执行“确认后主动退回”或将测试确认用于业务验收。
 
 真实双账号联调使用 acceptance.md 的分阶段 acceptance_dual.py：指定同事在本人电脑执行，处理方回读其真实确认与退回记录后推进。支持更新已安装技能后从共享工单准备本地公开计划，无须转交 zip；运行脚本指纹必须与工单一致，不能绕过版本保护。不把模拟测试或单账号演练记成双账号通过。当前验证范围见 [validation.md](references/validation.md)。
 
