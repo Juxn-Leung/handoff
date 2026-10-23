@@ -7,8 +7,8 @@ import json
 from pathlib import Path
 import sys
 
-from handoff_core import Git, HandoffError, State, exclusive_lock, read_json, requirement
-from tencent_mcp import TencentMCP, load_token, local_directory, prepare_directory
+from handoff_core import Git, HandoffError, State, exclusive_lock, read_json
+from tencent_mcp import TencentMCP, load_token, prepare_directory
 from tencent_tables import identity as live_identity, bind, create, tables, join
 from workflow import Workflow
 
@@ -49,7 +49,16 @@ def parser():
     b.add_argument("--repair", action="store_true", help="显式同意补齐缺失字段和必要数据表，保留既有数据")
     pub = sub.add_parser("publish", help="发布 AI 整理后的草稿 JSON")
     pub.add_argument("draft_file")
-    sub.add_parser("queue", help="只读扫描当前用户的队列")
+    pub.add_argument("--check", action="store_true", help="只校验草稿与共享范围重叠，不发布")
+    queue = sub.add_parser("queue", help="精简队列；完整需求与证据使用 show/review")
+    queue.add_argument("--app", action="append", help="按应用筛选，可重复；同时包含 apps 为 * 的共享事项")
+    queue.add_argument("--limit", type=int, default=20, help="本次最多显示条数，默认 20，上限 100")
+    queue.add_argument("--offset", type=int, default=0, help="跳过筛选后的条数")
+    preflight = sub.add_parser("preflight", help="提前检查接手方文件；保存本地计划，不修改远端、不授权编辑")
+    preflight.add_argument("record_id", nargs="?")
+    preflight.add_argument("--paths", nargs="+")
+    preflight.add_argument("--requirement", help="可选的 show 需求指纹；不符时停止")
+    preflight.add_argument("--plan", help='批量 JSON：{"plans": [{"record_id": "…", "paths": ["…"]}]}')
     show = sub.add_parser("show", help="查看工单内容和需求指纹")
     show.add_argument("record_id")
     start = sub.add_parser("start", help="开始单条任务；成功后才允许编辑代码")
@@ -68,14 +77,23 @@ def parser():
     block.add_argument("--reason", required=True)
     block.add_argument("--attempted", required=True)
     block.add_argument("--needed", required=True)
+    block.add_argument("--kind", choices=("manual", "files", "dependency"), default="manual")
+    block.add_argument("--waiting-for", nargs="+", help="阻塞关联的同表真实工单 ID")
+    block.add_argument("--paths", nargs="+", help="文件阻塞涉及的计划文件；不授权编辑")
     review = sub.add_parser("review", help="只读核对需求、代码证据和结果版本")
     review.add_argument("record_id")
+    confirm = sub.add_parser("confirm", help="指定验收人逐项确认同一结果版本；不代替原工作区验收回写")
+    confirm.add_argument("record_id")
+    confirm.add_argument("confirmation_file")
+    confirm.add_argument("--confirmed-version", required=True)
     accept = sub.add_parser("accept", help="仅在操作者明确验收通过后调用")
     accept.add_argument("record_id")
     accept.add_argument("--confirmed-version", required=True)
     reject = sub.add_parser("reject", help="操作者退回待验收工单")
     reject.add_argument("record_id")
     reject.add_argument("--reason", required=True)
+    reject.add_argument("--confirmed-version", help="新版工单退回须绑定已审阅的版本")
+    reject.add_argument("--criteria", nargs="+", help="退回涉及的验收标准 id；省略时关联本单所有标准")
     resume = sub.add_parser("resume", help="明确解除阻塞，恢复到待对接")
     resume.add_argument("record_id")
     resume.add_argument("--reason", required=True)
@@ -132,13 +150,24 @@ def execute(args):
         current = [r for r in roster if r["账号ID"] == identity["user_id"]]
         if len(current) != 1:
             raise HandoffError("join_required", "请先用本人账号 join 登记为共享成员；分工可选。")
-        flow = Workflow(git, state, identity, binding, tickets, logs)
+        flow = Workflow(git, state, identity, binding, tickets, logs, members)
         command = args.command
         if command == "queue":
-            return {**flow.queue(), "claimable": flow.claimable()}
+            return flow.queue(args.app, args.limit, args.offset)
         if command == "show":
-            row = tickets.get(args.record_id)
-            return {"record": row, "requirement_version": requirement(row)}
+            return flow.show(args.record_id)
+        if command == "preflight":
+            if args.plan:
+                if args.record_id or args.paths or args.requirement:
+                    raise HandoffError("invalid_plan", "--plan 不与单条工单参数混用。")
+                data = read_json(args.plan)
+                return flow.preflight(data.get("plans") if isinstance(data, dict) else None)
+            if not args.record_id or not args.paths:
+                raise HandoffError("invalid_plan", "单条预检需要 record_id 和 --paths。")
+            plan = {"record_id": args.record_id, "paths": args.paths}
+            if args.requirement:
+                plan["requirement_version"] = args.requirement
+            return flow.preflight([plan])
         if command == "claim":
             return flow.claim(args.record_id, args.requirement)
         if command == "assign":
@@ -147,7 +176,7 @@ def execute(args):
                 raise HandoffError("choose_member", "请选择成员表中唯一的账号 ID。")
             return flow.assign(args.record_id, {"user_id": args.user_id}, args.requirement)
         if command == "publish":
-            return flow.publish(read_json(args.draft_file))
+            return flow.publish(read_json(args.draft_file), args.check)
         if command == "start":
             return flow.start(args.record_id, args.paths, args.requirement)
         if command == "extend":
@@ -155,16 +184,16 @@ def execute(args):
         if command == "ready":
             return flow.ready(args.record_id, read_json(args.result_file), args.revalidate)
         if command == "block":
-            return flow.block(args.record_id, args.reason, args.attempted, args.needed)
+            return flow.block(args.record_id, args.reason, args.attempted, args.needed,
+                              args.kind, args.waiting_for, args.paths)
         if command == "review":
-            row = tickets.get(args.record_id)
-            flow._check_review(row, row.get("结果版本"))
-            return {"record_id": row["id"], "summary": row["处理结果"], "result_version": row["结果版本"],
-                    "code_and_requirements_current": True, "next": "等待操作者明确验收，此检查不能代替人工通过。"}
+            return flow.review(args.record_id)
+        if command == "confirm":
+            return flow.confirm(args.record_id, args.confirmed_version, read_json(args.confirmation_file))
         if command == "accept":
             return flow.accept(args.record_id, args.confirmed_version)
         if command == "reject":
-            return flow.reject(args.record_id, args.reason)
+            return flow.reject(args.record_id, args.reason, args.confirmed_version, args.criteria)
         if command == "resume":
             return flow.resume(args.record_id, args.reason)
         if command == "sync":

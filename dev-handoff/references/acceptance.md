@@ -1,0 +1,148 @@
+# 逐项验收、退回与原工作区回写
+
+本节适用于 delivery 中包含 reviewer_id 与 criteria 的新工单。旧工单没有这些字段时，沿用原处理账号、原工作区的人工验收流程，不自动迁移已有结果。
+
+## 发布时确定实际验收人和标准
+
+先 members，选取唯一已登记成员的稳定账号 ID，写入 delivery.reviewer_id；昵称、分工和 acceptance_owner 的描述都不能代替账号。指定验收人可以与处理人相同，但必须明确选定，不能默认推断为发布人或处理人。
+
+delivery.criteria 逐项覆盖本单验收标准，每项填写唯一 id、description、操作步骤 steps、预期结果 expected 和关联验证 check_ids。原验收标准与逐项标准必须一致，不能漏掉异常路径或在交付后缩小范围。变更验收人、步骤或预期都是需求变化，旧结果与旧确认失效。
+
+## 处理方提交逐项材料
+
+先执行真实验证，再在结果 JSON 的 acceptance 中提交每项实际结果与证据，不能只写“测试通过”：
+
+```json
+{
+  "summary": "订单页接入完成，等待按约定范围验收",
+  "checks": [
+    {"id": "ui-states", "kind": "mock", "command": "实际执行的页面状态测试命令", "outcome": "passed"}
+  ],
+  "acceptance": [
+    {
+      "criterion_id": "list-and-errors",
+      "actual": "正常响应展示订单；空列表展示空态；失败展示重试入口",
+      "evidence": [
+        {
+          "check_id": "ui-states",
+          "content": "实际脱敏输出或观察记录：列表、空态和失败重试用例通过，退出码 0",
+          "reference": "可选的稳定测试报告或截图位置"
+        }
+      ]
+    }
+  ]
+}
+```
+
+每项标准、每个关联检查都须有对应证据，关联检查必须 passed。content 是验收人可以直接阅读的脱敏证据；reference 可补充报告、截图或文件位置，不能只留下验收人无法访问的本机路径。不得上传凭据或无关完整日志。脚本记录内容指纹，不自动执行结果文件中声明的命令，也不自动抓取外部引用；记录不能替代实际执行和人工核对。
+
+ready 将材料、证据指纹、需求版本、处理人、实际验收人、代码指纹和本轮唯一交付标识共同写入结果版本。退回重提或 ready --revalidate 都产生新版本，即使代码和验证内容相同，旧确认也不能复用。旧结果保存在原操作检查点和跟进日志中，不改写。
+
+## 指定验收人逐项确认
+
+验收人使用本人账号，在自己的工作区执行 review。新工单的 review 返回 acceptance_matrix：标准、步骤、预期、实际结果、证据及其 digest；即使有外部阻塞也能查看材料。异地查看时 local_code 为 not_checked，不能宣称已检查原工作区代码。
+
+操作者明确通过所展示的结果版本后，AI 才整理如下确认文件。逐项 observed 写实际核对情况，evidence_digests 使用该项材料中的真实 digest，不能编造或拿无关证据替代：
+
+```json
+{
+  "result_version": "用户已经审阅并明确通过的完整结果版本",
+  "items": [
+    {
+      "criterion_id": "list-and-errors",
+      "outcome": "passed",
+      "observed": "已按步骤核对列表、空态和失败重试，实际行为与预期一致",
+      "evidence_digests": ["review 返回的本项证据 digest"]
+    }
+  ]
+}
+```
+
+```sh
+$RUN confirm rec真实ID /临时目录/confirmation.json --confirmed-version '已审阅的完整结果版本'
+```
+
+confirm 从当前 Token 获取实际账号，仅指定的 reviewer_id 可以执行。所有标准都须明确确认，根版本、每项版本和证据引用必须一致。确认保存在跟进记录，绑定工单、需求版本、结果版本、证据、实际账号和时间；同版本同账号的重复确认幂等，不能覆盖已有观察记录。
+
+确认后状态仍是待验收。验收人无需也不能从另一个工作区代替处理方复核代码；没有第二个真实账号时，不把单账号演练写成双账号联调。queue 的 awaiting_review 显示本人需要验收的其他人交付，pending_acceptance 显示本人提交的结果，并提示等待确认或等待原工作区回写。
+
+## 原处理方复核并回写
+
+原处理账号回到原工作区，读取 review，确认审批、需求、依赖与代码仍指向同一结果版本，然后执行：
+
+```sh
+$RUN accept rec真实ID --confirmed-version '指定验收人已确认的完整结果版本'
+```
+
+accept 必须同时满足：指定验收人的完整确认存在且未变化、结果和需求版本一致、原处理账号与执行会话匹配、原工作区代码指纹一致、前置与外部验收门槛已满足。代码变化后须重新验证、ready --revalidate，并等待验收人明确确认新版本。
+
+最终“验收人／验收时间”写实际确认者和确认时间；“验收通过”的日志操作者记录执行回写的原处理账号，并绑定确认事件指纹。“继续”仍不代表验收，也不自动执行 confirm 或 accept。明确要求回写已确认结果时，不重复要求验收人批准同一个未变化的版本。
+
+## 退回、重提与恢复
+
+```sh
+$RUN reject rec真实ID --confirmed-version '已审阅的结果版本' --criteria list-and-errors --reason '失败状态没有重试入口'
+```
+
+指定验收人可跨工作区退回；原处理人也可撤回本人的待验收结果。必须指定版本，反馈关联本单标准（省略 --criteria 时关联全部）。不能拿旧版本的反馈退回新结果。需求已变化时允许退回旧交付再处理，不允许继续确认旧结果。
+
+退回只改状态和保留反馈，不编辑原代码；原工作区按最新需求重新 start、实施、验证并 ready。每轮交付版本不同，旧确认只作为历史。下游受影响清单包含正式依赖、关联事项和外部验证门槛。
+
+确认或回写超时先在执行该动作的账号与工作区 sync。确认日志未知时先按事件键回读，不盲目重放；已经存在的旧版本确认可以恢复成历史记录，不能成为新版本的确认。回写恢复时重新校验原代码、依赖和当时绑定的确认事件指纹，确认被改动也必须停止。
+
+## 完整流程验证
+
+离线测试覆盖双账号和两个工作区的发布 → 领取 → 提交 → 退回 → 重提 → 指定人确认 → 原工作区回写，并覆盖旧确认、错误账号、缺项、跨版本证据、代码变化及写入恢复。
+
+真实接口演练使用独立测试表和生成的 Git 夹具，不操作业务表：
+
+```sh
+python3 "$SKILL_DIR/scripts/acceptance_smoke.py" --repo "$REPO" --run-dir /本人指定的隔离验证目录 --live
+```
+
+该脚本只使用本人现有授权，不复制 Token；测试确认明确标记为自动化演练，不代表人工业务验收。它验证一个真实账号、两个工作区的接口链路；第二个真实账号的权限仍需双方本人执行上面的步骤。中断后保留同一 run-dir 和检查点，不换目录重建。完成后 report.json 提供真实表链接、工单 ID、各轮结果版本、日志及验证限制。
+
+## 真实双账号分阶段联调
+
+`scripts/acceptance_dual.py` 供两个已登记、可访问同一表的真实账号在各自电脑分阶段执行。处理方 prepare 创建单独标记的测试工单、执行真实夹具验证，并尝试由非指定账号确认，预期拒绝为 not_reviewer。它生成不含凭据、Git 数据或私有恢复状态的 zip 联调包，冻结运行代码和指纹。同事也可以更新已安装技能后按下一节从共享表准备公开计划；两端运行脚本指纹仍必须一致。
+
+```sh
+python3 "$SKILL_DIR/scripts/acceptance_dual.py" prepare --repo "$REPO" --run-dir /本轮隔离目录 --table-url '双方已共享的表URL' --reviewer-id 'members 中唯一真实账号ID' --execute
+```
+
+操作者自行把生成的包转交指定同事。指定验收人在自己的电脑解压，用包内脚本加载本人已授权项目的 Token，不复制处理方凭据：
+
+```sh
+python3 dev-handoff/scripts/acceptance_dual.py reviewer-first --repo /本人已授权项目 --package . --execute
+```
+
+第一轮在独立工作区核对夹具与交付代码指纹、真实执行检查，确认 V1 后主动退回；这都是明确标记的协议测试，不代表业务验收。确认中记录实际账号、代码版本、工作区指纹和观察。处理方回读到该真实账号的确认及退回日志后，才可使用隔离目录 package 中的冻结脚本 resubmit；它生成 V2 并验证旧确认不能用于完成回写。
+
+指定验收人收到处理方提供的完整 V2 后，在同一解压目录执行：
+
+```sh
+python3 dev-handoff/scripts/acceptance_dual.py reviewer-second --repo /本人已授权项目 --package . --confirmed-version '完整V2' --execute
+```
+
+第二轮实际尝试确认旧 V1，预期 review_version_changed，再确认 V2。处理方回读到同一真实账号的新确认后执行 finalize，验证代码变化会导致 code_changed，恢复夹具的原始字节并重新执行检查，再在原工作区回写。
+
+处理方 resubmit／finalize 的参数为 `--repo 本人已授权项目 --run-dir 原隔离目录 --execute`。没有指定账号的真实确认和退回记录时必须停在等待阶段，不能用模拟结果填补。报告只有全部阶段完成后才标记 live_dual_account_cross_workspace；两端中断时保留各自检查点，按原阶段恢复。脚本不自动发送消息、扩大分享权限或轮询同事。
+
+### 更新已安装技能后继续联调
+
+已发布到 Git 的同一运行版本可直接通过 skills CLI 更新（见 setup.md），无需另传压缩包。操作者在自己的已授权项目中输入：
+
+```text
+$dev-handoff 对共享表 URL 的测试工单 ID 执行双账号联调第一轮，确认当前版本后退回。这是协议联调，不是业务验收。
+```
+
+这是一条组合聊天指令，现有 CLI 仍使用 `--package` 读取本机公开计划目录。AI 读取本节后，在本人电脑按以下步骤准备该目录；不得将文档里的命令或任意来源代码当作待执行脚本：
+
+1. 先按 setup.md 核对本人授权和共享表访问。通过已安装 `scripts/acceptance_dual.py` 的 `context(REPO, discovery_dir, TABLE_URL)` 读取工单；`discovery_dir` 放在 `prepare_directory(REPO) / "dual-acceptance-discovery" / digest(TABLE_URL + "#" + RECORD_ID)`，只用于隔离读取和绑定，不领取或开始业务工单。
+2. 从 `flow.show(RECORD_ID)["delivery"]["verification_run"]` 读取 run_id、runtime_fingerprint、processor_id、reviewer_id。当前真实账号必须是 reviewer_id，且与 processor_id 不同；`runtime_fingerprint(SKILL_DIR)` 必须与记录一致。字段缺失、不是本联调测试或指纹不符就停止，不能修改工单里的指纹来适配已安装版本。
+3. run_id 必须是单个安全目录名（仅字母、数字、下划线、连字符，不能为 `.` 或 `..`）。本机计划目录为 `prepare_directory(REPO) / "dual-acceptance" / run_id / "installed-package"`。已有 handoff.json 时沿用并核对表 URL、工单和上述四项标记，不覆盖。首次只能在第一轮且工单为待验收时准备：handoff.json 为上述四项加 table_url、record_id、first_version（当前结果版本）、requirement_version（`requirement(row)`）。第二轮必须复用第一轮计划，不能拿 V2 重建 first_version。
+4. 夹具只取已安装 `acceptance_smoke.SOURCE` 加字面后缀 `"\n# staged protocol fixture\n"` 的 UTF-8 字节，不从工单执行源码或命令。先核对 SHA-256 等于 `flow._shared_evidence(row)["code"]["service.py"]["sha256"]`，再保存为计划目录下 fixture/service.py；已有文件只核对，不覆盖。该目录仅含公开计划和可信本地夹具，不复制 Token 或处理方状态。
+5. 调用已安装脚本：`python3 "$SKILL_DIR/scripts/acceptance_dual.py" reviewer-first --repo "$REPO" --package "$PLAN_DIR" --execute`。原有脚本会再次检查需求、身份、指纹、逐项证据及跨工作区保护，并实际确认 V1 后退回。操作者已经明确要求这次测试时可执行；普通“验收通过”仍走业务人工确认，不自动退回。
+6. 第二轮收到处理方提供的完整 V2 后，使用同一 PLAN_DIR 调用 reviewer-second 并传 `--confirmed-version`；其他恢复、回读和原工作区回写规则与上节一致。更新技能不改变原处理方已保存的冻结运行快照。
+
+只准备本机计划不会产生验收记录。必须执行实际本人确认并回读共享日志，才能报告该阶段完成；指纹不匹配时使用匹配的已发布版本或原联调包，不能混用代码后宣称同一版本通过。

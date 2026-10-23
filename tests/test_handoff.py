@@ -97,12 +97,14 @@ class RepositoryCase(unittest.TestCase):
         self.state.project["bindings"] = [self.binding]
         self.state.save_project()
         self.tickets, self.logs = MemoryTable(), MemoryTable()
+        self.members = MemoryTable()
         for identity, role in ((BACKEND, "后端"), (FRONTEND, "前端")):
             self.state.data["identities"][identity["profile"]] = {"role": role}
+            self.members.rows[identity["user_id"]] = {"id": identity["user_id"], "账号ID": identity["user_id"], "姓名": identity["name"]}
         self.flow = self.make_flow(FRONTEND)
 
     def make_flow(self, identity=FRONTEND):
-        return Workflow(self.git, self.state, identity, self.binding, self.tickets, self.logs)
+        return Workflow(self.git, self.state, identity, self.binding, self.tickets, self.logs, self.members)
 
     def git_cmd(self, *args):
         return subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True).stdout
@@ -116,7 +118,25 @@ class RepositoryCase(unittest.TestCase):
             "key": key, "title": "读取订单", "description": "页面展示订单",
             "change_types": ["feat"], "paths": paths or ["api.py"],
             "handoff": "GET /orders，无请求体；返回 {items: []}。测试环境已可用。",
-            "acceptance": "订单页能展示返回数据；接口失败显示重试入口。", "critical_unknowns": []}]}
+            "acceptance": "订单页能展示返回数据；接口失败显示重试入口。", "critical_unknowns": [],
+            "delivery": self.acceptance_delivery()}]}
+
+    def delivery(self, apps=None):
+        return {"apps": apps or ["orders-app"], "scope": "订单列表页面", "deliverable": "接入订单列表，处理空状态和失败重试",
+                "acceptance_owner": "接手方操作者", "shared_contracts": [],
+                "checks": [{"id": "syntax", "description": "前端语法检查", "kind": "local", "owner": "接手方", "required": True}],
+                "external_checks": []}
+
+    def acceptance_delivery(self, reviewer="frontend"):
+        return {**self.delivery(), "reviewer_id": reviewer,
+                "criteria": [{"id": "syntax-valid", "description": "页面代码语法正确", "steps": ["执行页面语法检查"],
+                              "expected": "检查命令成功退出", "check_ids": ["syntax"]}]}
+
+    def confirmation(self, flow, rid):
+        report = flow.review(rid)
+        return {"result_version": report["result_version"], "items": [
+            {"criterion_id": c["id"], "outcome": "passed", "observed": "已核对本项操作、预期与所附结果证据。",
+             "evidence_digests": [e["digest"] for e in c["evidence"]]} for c in report["acceptance_matrix"]]}
 
     def ticket(self, rid="task-1", **patch):
         row = {"id": rid, "标题": "接入订单接口", "描述": "展示订单", "变更类型": ["feat"],
@@ -130,7 +150,8 @@ class RepositoryCase(unittest.TestCase):
         return self.flow.start(rid, paths or ["screen.js"], requirement(self.tickets.get(rid)))
 
     def result(self):
-        return {"summary": "订单页已接入，包含加载和错误重试。", "checks": [{"command": "node --check screen.js", "outcome": "passed"}]}
+        return {"summary": "订单页已接入，包含加载和错误重试。", "checks": [{"id": "syntax", "kind": "local", "command": "node --check screen.js", "outcome": "passed"}],
+                "acceptance": [{"criterion_id": "syntax-valid", "actual": "页面代码检查成功退出", "evidence": [{"check_id": "syntax", "content": "Offline fixture: syntax check exit code 0"}]}]}
 
 
 class GitTests(RepositoryCase):
@@ -189,9 +210,10 @@ class PublishingTests(RepositoryCase):
         (self.root / "screen.js").write_text("fetch('/orders');\n")
         ready = self.flow.ready(rid, self.result())
         self.assertEqual(self.tickets.get(rid)["状态"], "待验收")
+        self.flow.confirm(rid, ready["result_version"], self.confirmation(self.flow, rid))
         self.flow.accept(rid, ready["result_version"])
         self.assertEqual(self.tickets.get(rid)["状态"], "已完成")
-        self.assertEqual(len(self.logs.rows), 3)
+        self.assertEqual(len(self.logs.rows), 4)
 
     def test_repeat_publish_keeps_manual_edits(self):
         self.stage_backend()

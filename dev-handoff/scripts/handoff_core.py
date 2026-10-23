@@ -104,8 +104,10 @@ class Git:
     def clean_paths(self, paths):
         result = []
         for name in paths:
+            if not isinstance(name, str) or not name:
+                raise HandoffError("invalid_path", "只接受仓库内的相对文件路径。")
             path = PurePosixPath(name)
-            if not name or path.is_absolute() or ".." in path.parts or "\\" in name or path.parts[0] == ".git":
+            if not path.parts or path.is_absolute() or ".." in path.parts or "\\" in name or path.parts[0] == ".git":
                 raise HandoffError("invalid_path", "只接受仓库内的相对文件路径。", path=name)
             resolved = (self.root / name).resolve()
             if not resolved.is_relative_to(self.root):
