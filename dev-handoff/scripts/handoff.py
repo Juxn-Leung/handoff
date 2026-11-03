@@ -48,7 +48,7 @@ def parser():
     b.add_argument("url")
     b.add_argument("alias")
     b.add_argument("--repair", action="store_true", help="显式同意补齐缺失字段和必要数据表，保留既有数据")
-    bg = sub.add_parser("bind-group", help="以共享项目组目录 ID 接入进度表并核对文档权限")
+    bg = sub.add_parser("bind-group", help="以共享项目组目录链接或 ID 接入进度表并核对文档权限")
     bg.add_argument("folder_id")
     bg.add_argument("alias")
     up = sub.add_parser("groupify", help="将已绑定的旧进度表移入共享项目组并补齐文档列")

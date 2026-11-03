@@ -152,6 +152,43 @@ class MarkdownGroupTests(RepositoryCase):
         shown = {field["field_title"] for field in sheet["fields"] if not view["fieldMetas"][field["field_id"]]["hidden"]}
         self.assertEqual(shown, {"标题", "状态", "跟进人", "下一步", "文档"})
 
+    def test_group_bind_error_identifies_failed_resource(self):
+        original = self.frontend.call
+        folder_id = self.binding["group_id"]
+        def fail_folder(name, args, write=False):
+            if name == "manage.query_file_info" and args["file_id"] == folder_id:
+                raise HandoffError("mcp_rpc_error", "腾讯文档 MCP 返回错误。", rpc_code=-32603)
+            return original(name, args, write=write)
+        self.frontend.call = fail_folder
+        with self.assertRaises(HandoffError) as captured:
+            bind_group(self.frontend, self.fstate, self.fwho, folder_id, "项目")
+        self.assertEqual(captured.exception.details["step"], "folder_info")
+        self.assertEqual(captured.exception.details["resource_id"], folder_id)
+        self.assertIn("网页", captured.exception.details["next"])
+
+        self.frontend.call = original
+        rid = self.publish()
+        doc_id = self.bflow.tickets.get(rid)["_文档ID"]
+        def fail_document(name, args, write=False):
+            if name == "smartcanvas.get_top_level_pages" and args["file_id"] == doc_id:
+                raise HandoffError("mcp_rpc_error", "腾讯文档 MCP 返回错误。", rpc_code=-32603)
+            return original(name, args, write=write)
+        self.frontend.call = fail_document
+        with self.assertRaises(HandoffError) as captured:
+            bind_group(self.frontend, self.fstate, self.fwho, folder_id, "项目")
+        self.assertEqual(captured.exception.details["step"], "ticket_document")
+        self.assertEqual(captured.exception.details["resource_id"], doc_id)
+        self.assertIn("文档", captured.exception.details["next"])
+
+    def test_group_bind_accepts_shared_folder_link(self):
+        folder_id = self.binding["group_id"]
+        link = "https://docs.qq.com/desktop/mydoc/folder/" + folder_id + "?from=share"
+        result = bind_group(self.frontend, self.fstate, self.fwho, link, "项目")
+        self.assertEqual(result["bound"]["group_id"], folder_id)
+        with self.assertRaises(HandoffError):
+            bind_group(self.frontend, self.fstate, self.fwho,
+                       "https://docs.qq.com.evil.test/folder/" + folder_id, "项目")
+
     def test_group_bind_rejects_ticket_document_outside_folder(self):
         rid = self.publish()
         file_id = self.bflow.tickets.get(rid)["_文档ID"]

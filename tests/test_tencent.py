@@ -56,6 +56,17 @@ class TransportTests(unittest.TestCase):
             client.call("first", {}, write=True)
         self.assertEqual(sum(c[0] == "tools/call" for c in calls), 1)
 
+    def test_rpc_error_identifies_tool_without_exposing_response(self):
+        client = TencentMCP("test-only")
+        client.tools = {"manage.query_file_info": {"inputSchema": {"required": ["file_id"]}}}
+        def rpc(method, params, **kwargs):
+            raise HandoffError("mcp_rpc_error", "腾讯文档 MCP 返回错误。", rpc_code=-32603)
+        client.rpc = rpc
+        with self.assertRaises(HandoffError) as captured:
+            client.call("manage.query_file_info", {"file_id": "folder-1"})
+        self.assertEqual(captured.exception.details["tool"], "manage.query_file_info")
+        self.assertEqual(captured.exception.details["rpc_code"], -32603)
+
     def test_token_configuration_is_private_and_auth_start_reuses_pending_link(self):
         with tempfile.TemporaryDirectory() as directory:
             save_token(directory, "test-secret")

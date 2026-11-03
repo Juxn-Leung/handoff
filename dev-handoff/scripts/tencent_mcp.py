@@ -267,7 +267,10 @@ class TencentMCP:
         missing = [key for key in schema.get("required", []) if key not in arguments]
         if missing:
             raise HandoffError("tencent_tool_arguments", "所需工具参数缺失，请核对实时 Schema。", tool=name, missing=missing)
-        result = self.rpc("tools/call", {"name": name, "arguments": arguments}, write=write)
+        try:
+            result = self.rpc("tools/call", {"name": name, "arguments": arguments}, write=write)
+        except HandoffError as exc:
+            raise HandoffError(exc.code, exc.message, **{**exc.details, "tool": name}) from None
         if not isinstance(result, dict) or result.get("isError"):
             raise HandoffError("write_unknown" if write else "tencent_tool_error", "腾讯文档工具返回失败，需检查权限或回读写入结果。", tool=name)
         structured = result.get("structuredContent")

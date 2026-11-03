@@ -472,18 +472,51 @@ def create_group(client, state, who, name, alias, roles=None):
     return {"created": binding, "layout": layout, "group_id": folder["folder_id"],
             "owner_account_id": who["user_id"],
             "group_url": folder.get("folder_url"), "sharing_pending": True,
-            "next": "所有者在分享面板邀请成员；成员用 bind-group 接入并核对目录、表格和工单文档。"}
+            "next": "所有者先把项目组目录分享给指定成员（可编辑）；成员用本人账号 bind-group 核对目录、表格和已有文档，只有未继承权限的文件才单独补分享。"}
+
+
+def group_folder_id(selector):
+    if not isinstance(selector, str):
+        raise HandoffError("invalid_group", "请提供腾讯文档项目组目录链接或 ID。")
+    if selector.startswith("https://"):
+        parsed = urlparse(selector)
+        match = re.fullmatch(r"/(?:desktop/mydoc/)?folder/([A-Za-z0-9_-]{1,128})/?", parsed.path)
+        if parsed.hostname != "docs.qq.com" or not match:
+            raise HandoffError("invalid_group", "请提供腾讯文档项目组目录链接或 ID。")
+        return match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", selector):
+        return selector
+    raise HandoffError("invalid_group", "请提供腾讯文档项目组目录链接或 ID。")
 
 
 def bind_group(client, state, who, folder_id, alias):
     from tencent_documents import Documents
+    folder_id = group_folder_id(folder_id)
     Documents(client).require_capabilities()
-    meta = client.call("manage.query_file_info", {"file_id": folder_id})
+    def at(step, subject, operation, resource_id=None):
+        try:
+            return operation()
+        except HandoffError as exc:
+            guidance = {
+                "folder_info": "先用本人账号在网页打开项目组目录；打不开时由所有者核对定向分享，网页可打开而 MCP 仍报错时记录接口错误。",
+                "folder_list": "先用本人账号在网页查看目录内容；网页可查看而 MCP 仍报错时记录接口错误。",
+                "child_info": "核对该目录中文件的分享权限；若网页能打开该文件但 MCP 仍报错，记录接口错误。",
+                "table_bind": "核对进度表是否可用本人账号在网页编辑；目录可读而表格不可读时，由所有者单独分享进度表。",
+                "table_schema": "核对进度表是否可用本人账号在网页编辑；目录可读而表格不可读时，由所有者单独分享进度表。",
+                "ticket_rows": "核对进度表是否可用本人账号在网页读取；目录可读而表格不可读时，由所有者单独分享进度表。",
+                "ticket_document": "核对关联工单文档是否可用本人账号在网页打开；只有该文档无法访问时才单独补分享。",
+            }[step]
+            raise HandoffError(exc.code, subject + "检查失败：" + exc.message,
+                               **{**exc.details, "step": step, "target": subject,
+                                  "resource_id": resource_id, "next": guidance}) from None
+
+    meta = at("folder_info", "项目组目录",
+              lambda: client.call("manage.query_file_info", {"file_id": folder_id}), folder_id)
     if meta.get("file_id") != folder_id or not meta.get("is_folder"):
         raise HandoffError("invalid_group", "未读到可访问的腾讯文档项目组目录。")
     docs = Documents(client)
     candidates = []
-    items = docs.folder_items(folder_id)
+    items = at("folder_list", "项目组目录内容", lambda: docs.folder_items(folder_id), folder_id)
     child_ids = {item.get("id") for item in items}
     for item in items:
         file_id = item.get("id")
@@ -491,16 +524,19 @@ def bind_group(client, state, who, folder_id, alias):
             continue
         if item.get("type") and item["type"] != "smartsheet":
             continue
-        child = client.call("manage.query_file_info", {"file_id": file_id})
+        child = at("child_info", "目录中的文件",
+                   lambda: client.call("manage.query_file_info", {"file_id": file_id}), file_id)
         if child.get("type") == "smartsheet":
             candidates.append(child)
     if len(candidates) != 1:
         raise HandoffError("group_table_ambiguous", "项目组目录须有且只有一张进度智能表。")
-    binding = bind(client, state, who, candidates[0]["file_id"], alias, group_id=folder_id, group_url=meta.get("url"))
+    binding = at("table_bind", "进度表",
+                 lambda: bind(client, state, who, candidates[0]["file_id"], alias,
+                              group_id=folder_id, group_url=meta.get("url")), candidates[0]["file_id"])
     # Check the actual document, if one exists; an empty group cannot yet prove document inheritance.
     linked, document_ids = [], set()
-    tickets, _, _ = tables(client, binding, who)
-    for row in tickets.records():
+    tickets, _, _ = at("table_schema", "进度表结构", lambda: tables(client, binding, who), binding["base_id"])
+    for row in at("ticket_rows", "工单记录", lambda: tickets.records(), binding["base_id"]):
         if row.get("_文档ID"):
             if row["_文档ID"] in document_ids:
                 raise HandoffError("document_reused", "不同工单关联了同一份文档，须先核对一行一文档。",
@@ -508,7 +544,7 @@ def bind_group(client, state, who, folder_id, alias):
             document_ids.add(row["_文档ID"])
             if row["_文档ID"] not in child_ids:
                 raise HandoffError("document_outside_group", "工单关联文档不在项目组目录中。", record_id=row["id"])
-            docs.agreement(row["_文档ID"])
+            at("ticket_document", "工单文档", lambda: docs.agreement(row["_文档ID"]), row["_文档ID"])
             linked.append(row["id"])
     return {"bound": binding, "folder_readable": True, "table_readable": True,
             "document_readable": bool(linked), "documents_checked": len(linked), "document_check_pending": not bool(linked),
@@ -533,7 +569,7 @@ def groupify(client, state, who, binding, name=None):
     upgraded = bind(client, state, who, binding["base_id"], binding["alias"], repair=True,
                     group_id=folder_id, group_url=folder.get("folder_url"))
     return {"bound": upgraded, "group_id": folder_id, "group_url": folder.get("folder_url"),
-            "sharing_pending": True, "next": "所有者共享项目组目录，成员用 bind-group 核对访问。"}
+            "sharing_pending": True, "next": "所有者先分享项目组目录，成员用 bind-group 核对访问；未继承权限的文件再单独补分享。"}
 
 
 def tables(client, binding, who):
