@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import ssl
 import stat
 import sys
 import time
@@ -164,12 +165,22 @@ def decode_response(response, request_id):
 class TencentMCP:
     def __init__(self, token, opener=None):
         self.token = token
-        self.opener = opener or urllib.request.build_opener(NoRedirect())
+        self.opener = opener or self._opener()
         self.sequence = 0
         self.session = None
         self.protocol = "2025-03-26"
         self.initialized = False
         self.tools = None
+
+    @staticmethod
+    def _opener():
+        # The macOS Python.org build may have no OpenSSL CA file even though the
+        # operating system ships a verified CA bundle. Keep TLS verification on.
+        defaults = ssl.get_default_verify_paths()
+        if sys.platform == "darwin" and not defaults.cafile and Path("/etc/ssl/cert.pem").is_file():
+            context = ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+            return urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=context))
+        return urllib.request.build_opener(NoRedirect())
 
     def redact(self, value):
         if isinstance(value, str):

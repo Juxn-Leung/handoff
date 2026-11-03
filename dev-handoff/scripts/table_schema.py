@@ -23,6 +23,9 @@ TICKET_FIELDS = [
     field("创建时间", "date"), field("_工单键"), field("_执行标记"),
     field("_需求版本"), field("_结果证据"),
 ]
+GROUP_TICKET_FIELDS = TICKET_FIELDS + [
+    field("下一步"), field("文档"), field("_文档ID"), field("_约定指纹"),
+]
 LOG_FIELDS = [field("标题"), field("操作者", "user", multiple=False),
               field("时间", "date"), field("内容"), field("_事件键")]
 

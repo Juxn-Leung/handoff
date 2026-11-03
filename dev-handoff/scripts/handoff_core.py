@@ -211,7 +211,7 @@ class State:
         return found[0]
 
 
-REQUIREMENT_FIELDS = ("标题", "描述", "变更类型", "交接说明", "验收标准", "来源", "关联工单", "前置依赖")
+REQUIREMENT_FIELDS = ("标题", "描述", "变更类型", "交接说明", "验收标准", "来源", "关联工单", "前置依赖", "_约定指纹")
 
 
 def requirement(record):

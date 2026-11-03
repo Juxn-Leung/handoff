@@ -15,6 +15,8 @@ LAYOUTS = {
 def clean_layout(client, binding):
     result = []
     for title, (key, visible) in LAYOUTS.items():
+        if title == "工单" and binding.get("group_id"):
+            visible = ["标题", "状态", "跟进人", "下一步", "文档"]
         args = {"file_id": binding["base_id"], "sheet_id": binding[key]}
         fields = collection(client, "smartsheet.list_fields", args, "fields")
         names = {f["field_title"] for f in fields}

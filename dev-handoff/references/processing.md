@@ -1,5 +1,7 @@
 # 单条处理、验收和恢复
 
+项目组模式下，先用 `show` 读取关联文档中的“当前约定”和对话；旧工单没有文档时先执行 `migrate-document`，重新读取需求版本后才能 start。讨论用 `note` 追加，不改变状态；明确修改约定后用 `update-agreement` 或 `sync-agreement`。下文的范围保护、必要验证和逐项验收仍适用。发布方式见 [markdown-group.md](markdown-group.md)。
+
 以下 `$RUN` 代表 `python3 "$SKILL_DIR/scripts/handoff.py" --repo "$PROJECT_DIR" --table "$TABLE"`。
 实际工具调用时展开为独立参数，不把表格内容拼成 shell 命令，不用 eval。
 

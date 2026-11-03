@@ -7,7 +7,7 @@ import re
 from urllib.parse import urlparse
 
 from handoff_core import HandoffError, digest, table_time
-from table_schema import TICKET_FIELDS, LOG_FIELDS, ticket_links, log_links, normalized
+from table_schema import TICKET_FIELDS, GROUP_TICKET_FIELDS, LOG_FIELDS, ticket_links, log_links, normalized
 
 CORP = "tencent-personal"
 MEMBER_FIELDS = [
@@ -307,7 +307,7 @@ def resolve_file(client, selector):
     return file_id, meta["url"]
 
 
-def bind(client, state, who, selector, alias, repair=False, roles=None):
+def bind(client, state, who, selector, alias, repair=False, roles=None, group_id=None, group_url=None):
     if roles is not None:
         member_fields(roles)  # Validate before any remote mutation.
     base, url = resolve_file(client, selector)
@@ -346,7 +346,7 @@ def bind(client, state, who, selector, alias, repair=False, roles=None):
         selected[name] = matches[0]["sheet_id"]
         state.data.setdefault("tencent_table_creations", {}).setdefault(base + ":" + name, {})["pending"] = False
         state.save()
-    definitions = {"工单": TICKET_FIELDS + ticket_links(selected["工单"]),
+    definitions = {"工单": (GROUP_TICKET_FIELDS if group_id else TICKET_FIELDS) + ticket_links(selected["工单"]),
                    "跟进记录": LOG_FIELDS + log_links(selected["工单"]),
                    "成员": member_fields(roles) if roles is not None else remote_member_fields(client, base, selected["成员"])}
     for name, expected in definitions.items():
@@ -362,6 +362,8 @@ def bind(client, state, who, selector, alias, repair=False, roles=None):
         TencentTable(client, base, selected[name], expected).validate(repair, checkpoint, state.save)
     binding = {"provider": "tencent", "alias": alias, "url": url, "base_id": base, "table_id": selected["工单"],
                "log_table_id": selected["跟进记录"], "member_table_id": selected["成员"], "corp_id": CORP}
+    if group_id:
+        binding.update(group_id=group_id, group_url=group_url or "")
     state.project["bindings"] = [b for b in state.project["bindings"] if b.get("base_id") != base] + [binding]
     state.save_project()
     return binding
@@ -404,12 +406,140 @@ def create(client, state, who, name, alias, roles=None):
             "sharing": "请在腾讯文档分享面板添加指定同事为可编辑；不会自动改成所有人可编辑。"}
 
 
+def _group_folder(client, state, who, name, alias):
+    key = digest({"group": name, "alias": alias, "user": who["user_id"]})
+    checkpoint = state.data.setdefault("tencent_groups", {}).setdefault(key, {})
+    if checkpoint.get("folder_id"):
+        return checkpoint
+    if checkpoint.get("pending"):
+        raise HandoffError("group_create_unknown", "上次创建项目组目录结果未知，请先在腾讯文档核对，避免重复创建。")
+    checkpoint["pending"] = True
+    state.save()
+    try:
+        result = client.call("manage.create_file", {"title": name[:36], "file_type": "folder"}, write=True)
+    except HandoffError as exc:
+        if exc.details.get("not_executed"):
+            checkpoint["pending"] = False
+            state.save()
+        raise
+    if not result.get("file_id"):
+        raise HandoffError("group_create_unknown", "项目组目录未返回 ID，请先回读腾讯文档。")
+    checkpoint.update(folder_id=result["file_id"], folder_url=result.get("url", ""), pending=False)
+    state.save()
+    return checkpoint
+
+
+def create_group(client, state, who, name, alias, roles=None):
+    """Create a shared folder with one SmartSheet; access is verified by the joining account."""
+    member_fields(roles)
+    from tencent_documents import Documents
+    Documents(client).require_capabilities()
+    existing = [b for b in state.project["bindings"] if b["alias"] == alias]
+    if existing:
+        if len(existing) == 1 and existing[0].get("group_id"):
+            return {"created": existing[0], "already_created": True, "group_id": existing[0]["group_id"],
+                    "group_url": existing[0].get("group_url"), "owner_account_id": who["user_id"],
+                    "sharing_pending": True,
+                    "next": "请由另一成员用 bind-group 核对目录、进度表和工单文档访问。"}
+        raise HandoffError("alias_exists", "此别名已绑定其他项目。")
+    folder = _group_folder(client, state, who, name, alias)
+    key = digest({"group_table": folder["folder_id"], "alias": alias})
+    checkpoint = state.data.setdefault("tencent_group_tables", {}).setdefault(key, {})
+    if not checkpoint.get("file_id"):
+        if checkpoint.get("pending"):
+            raise HandoffError("group_create_unknown", "上次建组进度表结果未知，请先回读目录。")
+        checkpoint["pending"] = True
+        state.save()
+        try:
+            result = client.call("manage.create_file", {"title": name[:36], "file_type": "smartsheet",
+                        "parent_id": folder["folder_id"]}, write=True)
+        except HandoffError as exc:
+            if exc.details.get("not_executed"):
+                checkpoint["pending"] = False
+                state.save()
+            raise
+        if not result.get("file_id"):
+            raise HandoffError("group_create_unknown", "进度表未返回 ID，请先回读目录。")
+        checkpoint.update(file_id=result["file_id"], pending=False)
+        state.save()
+    binding = bind(client, state, who, checkpoint["file_id"], alias, repair=True, roles=roles,
+                   group_id=folder["folder_id"], group_url=folder.get("folder_url"))
+    from tencent_layout import clean_layout
+    try:
+        layout = clean_layout(client, binding)
+    except HandoffError as exc:
+        layout = {"pending": True, "error": exc.code, "next": "请在腾讯文档手动隐藏非进度列。"}
+    return {"created": binding, "layout": layout, "group_id": folder["folder_id"],
+            "owner_account_id": who["user_id"],
+            "group_url": folder.get("folder_url"), "sharing_pending": True,
+            "next": "所有者在分享面板邀请成员；成员用 bind-group 接入并核对目录、表格和工单文档。"}
+
+
+def bind_group(client, state, who, folder_id, alias):
+    from tencent_documents import Documents
+    Documents(client).require_capabilities()
+    meta = client.call("manage.query_file_info", {"file_id": folder_id})
+    if meta.get("file_id") != folder_id or not meta.get("is_folder"):
+        raise HandoffError("invalid_group", "未读到可访问的腾讯文档项目组目录。")
+    docs = Documents(client)
+    candidates = []
+    items = docs.folder_items(folder_id)
+    child_ids = {item.get("id") for item in items}
+    for item in items:
+        file_id = item.get("id")
+        if not file_id or item.get("is_folder"):
+            continue
+        if item.get("type") and item["type"] != "smartsheet":
+            continue
+        child = client.call("manage.query_file_info", {"file_id": file_id})
+        if child.get("type") == "smartsheet":
+            candidates.append(child)
+    if len(candidates) != 1:
+        raise HandoffError("group_table_ambiguous", "项目组目录须有且只有一张进度智能表。")
+    binding = bind(client, state, who, candidates[0]["file_id"], alias, group_id=folder_id, group_url=meta.get("url"))
+    # Check the actual document, if one exists; an empty group cannot yet prove document inheritance.
+    linked = []
+    tickets, _, _ = tables(client, binding, who)
+    for row in tickets.records():
+        if row.get("_文档ID"):
+            if row["_文档ID"] not in child_ids:
+                raise HandoffError("document_outside_group", "工单关联文档不在项目组目录中。", record_id=row["id"])
+            docs.agreement(row["_文档ID"])
+            linked.append(row["id"])
+            break
+    return {"bound": binding, "folder_readable": True, "table_readable": True,
+            "document_readable": bool(linked), "document_check_pending": not bool(linked),
+            "checked_account": who["user_id"], "cross_account_verified": False,
+            "next": "首次发布工单后，由另一账号再检查关联文档。" if not linked else
+                    "当前账号已读到目录、表格和工单文档；请与创建账号核对身份，不能把同账号回读算作双账号验证。"}
+
+
+def groupify(client, state, who, binding, name=None):
+    """Gradually upgrade an existing shared sheet without replacing its records."""
+    if binding.get("group_id"):
+        return {"bound": binding, "already_grouped": True}
+    from tencent_documents import Documents
+    Documents(client).require_capabilities()
+    folder = _group_folder(client, state, who, name or binding["alias"], binding["alias"])
+    folder_id = folder["folder_id"]
+    items = Documents(client).folder_items(folder_id)
+    if not any(item.get("id") == binding["base_id"] for item in items):
+        client.call("manage.move_file", {"file_id": binding["base_id"], "target_folder_id": folder_id}, write=True)
+        if not any(item.get("id") == binding["base_id"] for item in Documents(client).folder_items(folder_id)):
+            raise HandoffError("group_move_unknown", "进度表移动结果未确认，请回读目录后重试。")
+    upgraded = bind(client, state, who, binding["base_id"], binding["alias"], repair=True,
+                    group_id=folder_id, group_url=folder.get("folder_url"))
+    return {"bound": upgraded, "group_id": folder_id, "group_url": folder.get("folder_url"),
+            "sharing_pending": True, "next": "所有者共享项目组目录，成员用 bind-group 核对访问。"}
+
+
 def tables(client, binding, who):
     members = TencentTable(client, binding["base_id"], binding["member_table_id"],
                            remote_member_fields(client, binding["base_id"], binding["member_table_id"])).validate()
     people = {r["账号ID"]: r["姓名"] for r in members.records() if r.get("账号ID")}
     people[who["user_id"]] = who["name"]
-    tickets = TencentTable(client, binding["base_id"], binding["table_id"], TICKET_FIELDS + ticket_links(binding["table_id"]), people).validate()
+    ticket_fields = GROUP_TICKET_FIELDS if binding.get("group_id") else TICKET_FIELDS
+    tickets = TencentTable(client, binding["base_id"], binding["table_id"], ticket_fields + ticket_links(binding["table_id"]), people).validate()
     logs = TencentTable(client, binding["base_id"], binding["log_table_id"], LOG_FIELDS + log_links(binding["table_id"]), people).validate()
     return tickets, logs, members
 

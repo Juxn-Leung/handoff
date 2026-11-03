@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 from handoff_core import HandoffError, digest, now, table_time, owned, plan_queue, requirement, user_ids
 from table_schema import CHANGE_TYPES
-from delivery import contract, validate as validate_delivery, check_results, external_blockers, overlap_warnings
+from delivery import contract, source as contract_source, validate as validate_delivery, check_results, external_blockers, overlap_warnings
 from planning import Planner, shortened
 from acceptance import policy as acceptance_policy, materials as acceptance_materials, matrix as acceptance_matrix, confirmation as validate_confirmation
 
@@ -13,10 +14,11 @@ QUEUE_FIELDS = ["标题", "跟进人", "状态", "优先级", "关联工单", "�
 
 
 class Workflow:
-    def __init__(self, git, state, identity, binding, tickets, logs, members=None):
+    def __init__(self, git, state, identity, binding, tickets, logs, members=None, documents=None):
         self.git, self.state, self.identity = git, state, identity
         self.binding, self.tickets, self.logs = binding, tickets, logs
         self.members = members
+        self.documents = documents
         if binding["corp_id"] != identity["corp_id"]:
             raise HandoffError("organization_mismatch", "工单表绑定的组织与当前账号不同。")
         self.namespace = binding["base_id"] + ":" + binding["table_id"]
@@ -34,6 +36,18 @@ class Workflow:
     def check_owner(self, row):
         if not owned(row, self.identity):
             raise HandoffError("owner_changed", "工单跟进人不是当前账号，或跟进人不唯一。")
+
+    def _document_guard(self, row):
+        file_id = row.get("_文档ID")
+        if not file_id:
+            return None
+        if self.documents is None:
+            raise HandoffError("document_unavailable", "此工单需要读取关联文档后才能操作。")
+        agreement = self.documents.agreement(file_id)
+        if agreement["hash"] != row.get("_约定指纹"):
+            raise HandoffError("requirements_changed", "文档当前约定已变化；请阅读并同步需求版本。",
+                               document=row.get("文档"), document_hash=agreement["hash"])
+        return agreement
 
     def registered_member(self, uid):
         if self.members is None:
@@ -147,9 +161,20 @@ class Workflow:
         if rid not in planner.by_id:
             raise HandoffError("record_missing", "工单不存在或无权读取。")
         row = planner.by_id[rid]
-        return {"record": row, "requirement_version": requirement(row), "delivery": contract(row),
+        if self.binding.get("group_id") and not row.get("_文档ID"):
+            legacy_next = "旧工单再次处理前执行 migrate-document，生成关联文档。"
+        else:
+            legacy_next = "当前约定变化时先明确同步需求版本；历史备注不作为当前操作指引。"
+        document = None
+        if row.get("_文档ID"):
+            if self.documents is None:
+                raise HandoffError("document_unavailable", "此工单需要读取关联文档。")
+            agreement = self.documents.agreement(row["_文档ID"])
+            document = {"url": row.get("文档"), "content": self.documents.content(row["_文档ID"]),
+                        "agreement": agreement["text"], "agreement_current": agreement["hash"] == row.get("_约定指纹")}
+        return {"record": row, "requirement_version": requirement(row), "delivery": contract(row), "document": document,
                 "current_blocking": planner.current(row),
-                "next": "当前提示按本次读取计算；历史备注不作为当前操作指引。"}
+                "next": legacy_next}
 
     def preflight(self, plans):
         """Save receiver-side plans locally; never claim, lock files, or modify remote tickets."""
@@ -203,7 +228,10 @@ class Workflow:
     def claim(self, rid, expected):
         self._guard_clean()
         row = self.tickets.get(rid)
+        if self.binding.get("group_id") and not row.get("_文档ID"):
+            raise HandoffError("document_migration_required", "旧工单领取前须先生成关联文档并重新读取需求版本。")
         if row.get("跟进人") == self.person:
+            self._document_guard(row)
             return {"claimed": rid, "already_owned": True}
         if requirement(row) != expected:
             raise HandoffError("remote_changed", "领取前需求版本发生变化，请重新阅读。")
@@ -215,6 +243,8 @@ class Workflow:
     def assign(self, rid, target, expected):
         self._guard_clean()
         row = self.tickets.get(rid)
+        if self.binding.get("group_id") and not row.get("_文档ID"):
+            raise HandoffError("document_migration_required", "旧工单分配前须先生成关联文档并重新读取需求版本。")
         if requirement(row) != expected or row.get("状态") != "待对接" or row.get("_执行标记"):
             raise HandoffError("remote_changed", "只能分配需求版本未变且尚未开始的工单。")
         if self.identity["user_id"] not in user_ids(row.get("发布人")):
@@ -236,6 +266,18 @@ class Workflow:
             raise HandoffError("sync_required", "存在尚未确认的表格写入，请先执行 sync。", operation_ids=[p["id"] for p in pending])
 
     def _finish_operation(self, op):
+        if op.get("document_event"):
+            if self.documents is None:
+                raise HandoffError("document_unavailable", "无法补写工单文档对话。")
+            event = op["document_event"]
+            try:
+                self.documents.append_once(event["file_id"], op["id"], event["actor"], event["message"],
+                                           uncertain=op.get("document_uncertain", False))
+            except HandoffError as exc:
+                if exc.code in ("write_unknown", "document_append_unknown"):
+                    op["document_uncertain"] = True
+                    self.state.save()
+                raise
         values = {
             "标题": op["title"], "工单": [op["record_id"]], "操作者": op["person"],
             "时间": op["time"], "内容": op["message"],
@@ -250,8 +292,11 @@ class Workflow:
         op["phase"] = "done"
         self.state.save()
 
-    def _apply(self, row, patch, title, message, session=None, set_last=False, acceptance_binding=None):
+    def _apply(self, row, patch, title, message, session=None, set_last=False, acceptance_binding=None,
+               allow_requirement_change=False):
         self._guard_clean()
+        if not allow_requirement_change:
+            self._document_guard(row)
         fresh = self.tickets.get(row["id"])
         if digest(fresh) != digest(row):
             raise HandoffError("remote_changed", "工单在读取后被修改，请重新查看后再操作。")
@@ -263,12 +308,27 @@ class Workflow:
               "before": row, "patch": patch, "title": title, "message": message,
               "person": self.person, "profile": self.identity["profile"], "time": table_time(),
               "phase": "prepared", "session": session, "set_last": set_last}
+        if self.binding.get("group_id"):
+            next_steps = {"领取工单": "阅读文档并开始处理", "分配工单": "等待负责人开始处理",
+                          "开始处理": "负责人处理中", "提交待验收": "等待指定验收人检查",
+                          "处理阻塞": "查看文档中的阻塞原因", "验收退回": "按退回意见修复",
+                          "解除阻塞": "重新阅读约定并开始处理", "验收通过": "已完成",
+                          "同步当前约定": "按新约定重新检查", "迁移旧工单": "阅读文档并处理"}
+            if "下一步" not in patch and title in next_steps:
+                patch["下一步"] = next_steps[title]
+            file_id = patch.get("_文档ID") or row.get("_文档ID")
+            if file_id:
+                op["document_event"] = {"file_id": file_id, "actor": self.identity["name"],
+                                        "message": f"**{title}**\n\n{message}"}
         if acceptance_binding:
             op["acceptance_binding"] = acceptance_binding
+        if allow_requirement_change:
+            op["allow_requirement_change"] = True
         self.state.data["operations"][op["id"]] = op
         self.state.save()
         updated = self.tickets.update(row["id"], patch)
-        if requirement(updated) != requirement(row) or updated.get("跟进人") != patch.get("跟进人", row.get("跟进人")):
+        expected_requirement = requirement({**row, **patch}) if allow_requirement_change else requirement(row)
+        if requirement(updated) != expected_requirement or updated.get("跟进人") != patch.get("跟进人", row.get("跟进人")):
             raise HandoffError("remote_changed", "写入期间需求或跟进人发生变化，必须人工复核。")
         op["phase"] = "record_verified"
         self.state.save()
@@ -302,7 +362,10 @@ class Workflow:
                 continue
             row = self.tickets.get(op["record_id"])
             owners = (op["before"].get("跟进人"), op["patch"].get("跟进人", op["before"].get("跟进人")))
-            if requirement(row) != requirement(op["before"]) or row.get("跟进人") not in owners:
+            allowed_requirements = {requirement(op["before"])}
+            if op.get("allow_requirement_change"):
+                allowed_requirements.add(requirement({**op["before"], **op["patch"]}))
+            if requirement(row) not in allowed_requirements or row.get("跟进人") not in owners:
                 raise HandoffError("remote_changed", "恢复时发现需求或负责人已变化，未覆盖远端内容。")
             if not self.tickets.matches(row, op["patch"]):
                 if digest(row) != digest(op["before"]):
@@ -323,6 +386,15 @@ class Workflow:
                 self.state.save()
                 raise
             results.append({"operation": op["id"], "record_id": op["record_id"], "verified": True})
+        for note in self.state.data.setdefault("document_notes", {}).values():
+            if note.get("namespace") != self.namespace or note.get("phase") == "done":
+                continue
+            if note.get("profile") != self.identity["profile"]:
+                raise HandoffError("identity_mismatch", "待恢复文档对话属于另一个账号。")
+            self.documents.append_once(note["file_id"], note["event_id"], note["actor"], note["message"], uncertain=True)
+            note["phase"] = "done"
+            self.state.save()
+            results.append({"document_event": note["event_id"], "record_id": note["record_id"], "verified": True})
         return results
 
     def abandon_operation(self, operation_id, reason):
@@ -344,6 +416,8 @@ class Workflow:
                 "next": "保留全部检查点；原工单仍须人工核实，不代表已验收、撤销或恢复。"}
 
     def publish(self, manifest, check_only=False):
+        if isinstance(manifest, dict) and manifest.get("mode") == "markdown":
+            return self.publish_documents(manifest, check_only)
         self._guard_clean()
         snapshot = self.git.staged()
         if manifest.get("snapshot") != snapshot["fingerprint"]:
@@ -440,6 +514,217 @@ class Workflow:
         return {"published": output, "table_url": self.binding["url"], "overlap_warnings": warnings,
                 "next": "由已登记成员本人 claim 领取，或由发布方 assign 给已登记成员；接手方用 preflight 提前检查实际文件。"}
 
+    def publish_documents(self, manifest, check_only=False):
+        self._guard_clean()
+        if not self.binding.get("group_id") or self.documents is None:
+            raise HandoffError("group_required", "Markdown 发布需要先建组或将现有表升级为项目组。")
+        selector = manifest.get("source")
+        if not isinstance(selector, str) or not selector.strip():
+            raise HandoffError("invalid_draft", "Markdown 发布草稿需要 source 路径或腾讯文档链接。")
+        source = self.documents.source(selector)
+        if not check_only and not manifest.get("source_digest"):
+            raise HandoffError("source_digest_required", "发布前须使用 --check 取得来源指纹并写入草稿，防止来源在整理后变化。")
+        if manifest.get("source_digest") and manifest["source_digest"] != source["digest"]:
+            raise HandoffError("source_changed", "来源文档已变化，请重新整理发布草稿。")
+        drafts = manifest.get("tickets")
+        if not isinstance(drafts, list) or not drafts:
+            raise HandoffError("invalid_draft", "Markdown 发布草稿须包含非空 tickets 数组。")
+        keys, prepared = set(), []
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                raise HandoffError("invalid_draft", "每条工单须是对象。")
+            key = draft.get("key")
+            if not isinstance(key, str) or not key.strip() or key in keys:
+                raise HandoffError("invalid_draft", "每项交付须有唯一稳定的 key。")
+            keys.add(key)
+            for field in ("title", "description", "agreement"):
+                if not isinstance(draft.get(field), str) or not draft[field].strip():
+                    raise HandoffError("invalid_draft", "Markdown 工单缺少非空 " + field + "。", key=key)
+            if len(drafts) > 1 and not isinstance(draft.get("excerpt"), str):
+                raise HandoffError("invalid_draft", "一份长文档拆成多单时，每单须给出对应摘录。", key=key)
+            if draft.get("critical_unknowns"):
+                raise HandoffError("needs_clarification", "关键约定尚未明确，暂不发布。", key=key, questions=draft["critical_unknowns"])
+            types = draft.get("change_types") or ["change"]
+            if not isinstance(types, list) or not types or not set(types).issubset(CHANGE_TYPES):
+                raise HandoffError("invalid_draft", "变更类型须使用 feat/fix/change/remove/refactor。", key=key)
+            delivery = validate_delivery(draft.get("delivery"), require_acceptance=True)
+            self.registered_member(delivery["reviewer_id"])
+            for check in delivery["external_checks"]:
+                if check.get("ticket_id"):
+                    self.tickets.get(check["ticket_id"])
+            for link in ("related", "dependencies"):
+                if not isinstance(draft.get(link, []), list):
+                    raise HandoffError("invalid_draft", "关联和依赖须是现有工单 ID 数组。")
+                for rid in draft.get(link, []):
+                    self.tickets.get(rid)
+            priority = draft.get("priority", "普通")
+            if priority not in ("紧急", "普通", "低"):
+                raise HandoffError("invalid_draft", "优先级须是紧急、普通或低。")
+            paths = self.git.clean_paths(draft.get("paths") or [])
+            prepared.append((draft, types, delivery, priority, paths))
+        if manifest.get("code_snapshot"):
+            if self.git.staged()["fingerprint"] != manifest["code_snapshot"]:
+                raise HandoffError("staged_changed", "所附代码快照已变化，请重新核对。")
+        remote_keys = {digest({"namespace": self.namespace, "source": source["digest"], "key": d["key"]})
+                       for d, _, _, _, _ in prepared}
+        warnings = overlap_warnings([("draft:" + d["key"], delivery) for d, _, delivery, _, _ in prepared] +
+                    [(r["id"], contract(r)) for r in self.tickets.records()
+                     if r.get("状态") != "已完成" and r.get("_工单键") not in remote_keys], len(prepared))
+        if check_only:
+            return {"checked": [{"key": d["key"], "title": d["title"]} for d, _, _, _, _ in prepared],
+                    "source_digest": source["digest"], "overlap_warnings": warnings, "remote_modified": False}
+        batch_key = self.namespace + ":markdown:" + digest({"source": source["digest"], "keys": sorted(keys)})
+        batch = self.state.data["batches"].setdefault(batch_key, {"manifest_hash": digest(manifest), "items": {}})
+        if batch["manifest_hash"] != digest(manifest):
+            raise HandoffError("draft_changed", "同一来源已有发布检查点；请沿用原草稿恢复。")
+        self.state.save()
+        output = []
+        for draft, types, delivery, priority, paths in prepared:
+            key = draft["key"]
+            remote_key = digest({"namespace": self.namespace, "source": source["digest"], "key": key})
+            item = batch["items"].setdefault(key, {"phase": "new"})
+            if item.get("phase") == "verified":
+                row = self.tickets.get(item["record_id"])
+                if row.get("_工单键") != remote_key or row.get("_文档ID") != item.get("document_id"):
+                    raise HandoffError("remote_changed", "已发布工单的业务键或文档关联发生变化。")
+                output.append({"id": row["id"], "title": row["标题"], "document": row["文档"], "key": key})
+                continue
+            initial = draft.get("excerpt") or source["content"]
+            ref = source["source"] if source["source"].startswith("https://") else Path(source["source"]).name
+            try:
+                doc = self.documents.create(self.binding["group_id"], draft["title"], remote_key,
+                                            draft["agreement"], initial, self.identity["name"], ref,
+                                            uncertain=item.get("document_uncertain", False))
+            except HandoffError as exc:
+                if exc.code in ("write_unknown", "document_create_unknown", "agreement_create_unknown", "document_append_unknown"):
+                    item["document_uncertain"] = True
+                    self.state.save()
+                raise
+            item.update(document_id=doc["file_id"], document_url=doc["url"])
+            self.state.save()
+            source_data = {"mode": "markdown", "source": ref, "source_digest": source["digest"],
+                           "paths": paths, "repository": self.git.root.name, "delivery": delivery}
+            if manifest.get("code_snapshot"):
+                source_data["code_snapshot"] = manifest["code_snapshot"]
+            values = {"标题": draft["title"], "描述": draft["description"], "变更类型": types,
+                      "发布人": self.person, "跟进人": [], "状态": "待对接", "优先级": priority,
+                      "交接说明": "详细交接见关联文档", "验收标准": "逐项标准见关联文档及隐藏交付约定",
+                      "来源": json.dumps(source_data, ensure_ascii=False), "关联工单": draft.get("related", []),
+                      "前置依赖": draft.get("dependencies", []), "创建时间": table_time(),
+                      "下一步": "待领取", "文档": doc["url"], "_文档ID": doc["file_id"],
+                      "_约定指纹": doc["agreement_hash"]}
+            uncertain = item.get("phase") == "unknown"
+            item["phase"] = "unknown"
+            self.state.save()
+            try:
+                row = self.tickets.create_once("_工单键", remote_key, values, uncertain=uncertain)
+            except HandoffError as exc:
+                if exc.details.get("not_executed"):
+                    item["phase"] = "new"
+                    self.state.save()
+                raise
+            if row.get("_文档ID") != doc["file_id"]:
+                raise HandoffError("document_link_changed", "工单键已存在，但文档关联不同。")
+            item.update(phase="verified", record_id=row["id"])
+            self.state.save()
+            output.append({"id": row["id"], "title": row["标题"], "document": doc["url"], "key": key})
+        return {"published": output, "table_url": self.binding["url"], "group_url": self.binding.get("group_url"),
+                "overlap_warnings": warnings, "next": "成员在进度表查看状态，Agent 从每行文档继续对话。"}
+
+    def migrate_document(self, rid):
+        self._guard_clean()
+        if not self.binding.get("group_id") or self.documents is None:
+            raise HandoffError("group_required", "请先将现有表升级为项目组。")
+        row = self.tickets.get(rid)
+        if row.get("_文档ID"):
+            return {"record_id": rid, "document": row["文档"], "already_migrated": True}
+        if row.get("状态") not in ("待对接", "阻塞"):
+            raise HandoffError("migration_state", "旧工单仅在待对接或阻塞时迁移，保留现有验收结果。")
+        agreement = "\n\n".join(str(row.get(k) or "").strip() for k in ("描述", "交接说明", "验收标准") if row.get(k)) or row["标题"]
+        initial = "从旧工单迁入。原始交接、验收记录和证据仍保留在进度表的隐藏字段中。\n\n" + agreement
+        doc = self.documents.create(self.binding["group_id"], row["标题"], "legacy:" + self.key(rid),
+                                    agreement, initial, self.identity["name"], self.binding["url"])
+        self._apply(row, {"文档": doc["url"], "_文档ID": doc["file_id"], "_约定指纹": doc["agreement_hash"]},
+                    "迁移旧工单", "旧工单已关联文档；原历史保留。", allow_requirement_change=True)
+        return {"record_id": rid, "document": doc["url"], "migrated": True}
+
+    def sync_agreement(self, rid, revised_delivery=None):
+        self._guard_clean()
+        row = self.tickets.get(rid)
+        if not row.get("_文档ID") or self.documents is None:
+            raise HandoffError("document_missing", "此工单尚未关联文档。")
+        actual = self.documents.agreement(row["_文档ID"])
+        if actual["hash"] == row.get("_约定指纹"):
+            return {"record_id": rid, "requirement_version": requirement(row), "already_current": True}
+        if row.get("状态") == "已完成":
+            raise HandoffError("completed_agreement", "已完成工单的约定不能直接改写；新需求请发布新工单。")
+        existing_delivery = contract(row)
+        if existing_delivery and revised_delivery is None:
+            raise HandoffError("delivery_revision_required", "当前约定变化后，须重新核对并提交逐项交付与验收契约；可以明确沿用原内容。")
+        patch = {"_约定指纹": actual["hash"]}
+        if row.get("状态") in ("处理中", "待验收"):
+            patch.update({"状态": "待对接", "_执行标记": ""})
+        if revised_delivery is not None:
+            revised_delivery = validate_delivery(revised_delivery, require_acceptance=bool(acceptance_policy(existing_delivery)))
+            if acceptance_policy(revised_delivery):
+                self.registered_member(revised_delivery["reviewer_id"])
+            patch["来源"] = json.dumps({**contract_source(row), "delivery": revised_delivery}, ensure_ascii=False)
+        self._apply(row, patch, "同步当前约定",
+                    "文档当前约定已明确更新。", allow_requirement_change=True)
+        updated = self.tickets.get(rid)
+        return {"record_id": rid, "requirement_version": requirement(updated),
+                "previous_result_stale": bool(row.get("结果版本")), "agreement": actual["text"]}
+
+    def update_agreement(self, rid, expected_hash, text, revised_delivery=None):
+        self._guard_clean()
+        row = self.tickets.get(rid)
+        if not row.get("_文档ID") or self.documents is None:
+            raise HandoffError("document_missing", "此工单尚未关联文档。")
+        if row.get("状态") == "已完成":
+            raise HandoffError("completed_agreement", "已完成工单的约定不能直接改写；新需求请发布新工单。")
+        if expected_hash != row.get("_约定指纹"):
+            raise HandoffError("requirements_changed", "请先核对当前约定及需求版本。")
+        if contract(row) and revised_delivery is None:
+            raise HandoffError("delivery_revision_required", "修改当前约定前须准备已核对的逐项交付与验收契约。")
+        if revised_delivery is not None:
+            revised_delivery = validate_delivery(revised_delivery, require_acceptance=bool(acceptance_policy(contract(row))))
+            if acceptance_policy(revised_delivery):
+                self.registered_member(revised_delivery["reviewer_id"])
+        self.documents.update_agreement(row["_文档ID"], expected_hash, text)
+        return self.sync_agreement(rid, revised_delivery)
+
+    def append_note(self, rid, message, event_id=None):
+        row = self.tickets.get(rid)
+        if not row.get("_文档ID") or self.documents is None:
+            raise HandoffError("document_missing", "此工单尚未关联文档。")
+        if not isinstance(message, str) or not message.strip():
+            raise HandoffError("invalid_note", "对话内容不能为空。")
+        notes = self.state.data.setdefault("document_notes", {})
+        pending = [n for n in notes.values() if n.get("namespace") == self.namespace and n.get("record_id") == rid
+                   and n.get("phase") != "done"]
+        if len(pending) > 1 or (pending and pending[0]["message"] != message):
+            raise HandoffError("document_sync_required", "此工单有尚未确认的对话写入，请先 sync。")
+        event_id = pending[0]["event_id"] if pending else (event_id or str(uuid.uuid4()))
+        key = self.key(rid) + ":note:" + event_id
+        entry = notes.setdefault(key, {"namespace": self.namespace, "record_id": rid, "file_id": row["_文档ID"],
+                                       "event_id": event_id, "actor": self.identity["name"], "message": message,
+                                       "profile": self.identity["profile"], "phase": "prepared"})
+        if entry["message"] != message or entry["file_id"] != row["_文档ID"]:
+            raise HandoffError("document_event_changed", "事件 ID 已用于其他文档内容。")
+        self.state.save()
+        try:
+            self.documents.append_once(row["_文档ID"], event_id, self.identity["name"], message,
+                                       uncertain=entry["phase"] == "unknown")
+        except HandoffError as exc:
+            if exc.code in ("write_unknown", "document_append_unknown"):
+                entry["phase"] = "unknown"
+                self.state.save()
+            raise HandoffError(exc.code, exc.message, event_id=event_id) from None
+        entry["phase"] = "done"
+        self.state.save()
+        return {"record_id": rid, "document": row["文档"], "event_id": event_id,
+                "requirement_version": requirement(row), "status_unchanged": True}
+
     def _scope_conflicts(self, rid, paths):
         conflicts = self.planner().file_conflicts(rid, paths)
         if conflicts:
@@ -448,6 +733,8 @@ class Workflow:
     def start(self, rid, paths, expected):
         self._guard_clean()
         row = self.tickets.get(rid)
+        if self.binding.get("group_id") and not row.get("_文档ID"):
+            raise HandoffError("document_migration_required", "旧工单再次处理前须先生成关联文档并重新读取需求版本。")
         self.check_owner(row)
         if row.get("状态") != "待对接" or row.get("_执行标记"):
             raise HandoffError("already_started", "工单不是未领取的待对接事项，不能覆盖其他会话。")
@@ -463,7 +750,8 @@ class Workflow:
         if not paths:
             raise HandoffError("invalid_scope", "开始前必须声明计划修改的文件路径。")
         self._scope_conflicts(rid, paths)
-        active = [s for s in self.state.data["sessions"].values() if s.get("phase") == "working"]
+        active = [s for s in self.state.data["sessions"].values() if s.get("phase") == "working"
+                  and not (s.get("record_id") == rid and s.get("requirement") != expected)]
         if active:
             raise HandoffError("active_task", "当前工作区仍有一条正在处理的工单，请先完成或记录阻塞。")
         session = {"record_id": rid, "profile": self.identity["profile"], "phase": "working",
@@ -564,6 +852,8 @@ class Workflow:
         return {"blocked": rid, "stop": True, "queue": self.queue()}
 
     def _shared_evidence(self, row, confirmed_version=None, allow_outdated=False):
+        if not allow_outdated:
+            self._document_guard(row)
         if confirmed_version is not None and row.get("结果版本") != confirmed_version:
             raise HandoffError("review_version_changed", "操作者审阅的结果版本与当前版本不同。")
         try:
@@ -645,6 +935,9 @@ class Workflow:
             prior = json.loads(self.logs.records(equals={"_事件键": key})[0]["内容"])
             if prior["items"] != items:
                 raise HandoffError("confirmation_changed", "本版本已有不可覆盖的确认；需要调整时先退回或提交新版本。")
+            if self.binding.get("group_id") and row.get("下一步") != "等待原工作区复核并完成":
+                self._apply(row, {"下一步": "等待原工作区复核并完成"}, "验收确认",
+                            "指定验收人已确认结果版本：" + confirmed_version)
             return {"confirmed": rid, "result_version": confirmed_version, "already_confirmed": True,
                     "next": "仍待原处理账号在原工作区复核代码并 accept 回写。"}
         if digest(self.tickets.get(rid)) != digest(row):
@@ -664,6 +957,9 @@ class Workflow:
             op["log_uncertain"] = not exc.details.get("not_executed", False)
             self.state.save()
             raise
+        if self.binding.get("group_id"):
+            self._apply(row, {"下一步": "等待原工作区复核并完成"}, "验收确认",
+                        "指定验收人已确认结果版本：" + confirmed_version)
         return {"confirmed": rid, "result_version": confirmed_version, "reviewer_id": self.identity["user_id"],
                 "event_key": key, "stop": True, "next": "业务确认已记录；等待原工作区已启用的自动回写，或由原处理账号 accept。尚不能报告已完成。"}
 

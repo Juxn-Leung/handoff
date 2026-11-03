@@ -9,7 +9,8 @@ import sys
 
 from handoff_core import Git, HandoffError, State, exclusive_lock, read_json
 from tencent_mcp import TencentMCP, load_token, prepare_directory
-from tencent_tables import identity as live_identity, bind, create, tables, join
+from tencent_tables import identity as live_identity, bind, create_group, bind_group, groupify, tables, join
+from tencent_documents import Documents
 from workflow import Workflow
 
 
@@ -38,7 +39,7 @@ def parser():
     idx = sub.add_parser("index-file", help="读取文件的暂存版本")
     idx.add_argument("path")
     sub.add_parser("tables", help="列出当前项目绑定的工单表")
-    c = sub.add_parser("create", help="创建并绑定工单表")
+    c = sub.add_parser("create", help="创建共享项目组、进度表和文档目录")
     c.add_argument("name")
     c.add_argument("--alias")
     c.add_argument("--roles", nargs="+", help="可选的成员分工选项，如 前端 后端 测试；默认自由填写或留空")
@@ -47,9 +48,18 @@ def parser():
     b.add_argument("url")
     b.add_argument("alias")
     b.add_argument("--repair", action="store_true", help="显式同意补齐缺失字段和必要数据表，保留既有数据")
+    bg = sub.add_parser("bind-group", help="以共享项目组目录 ID 接入进度表并核对文档权限")
+    bg.add_argument("folder_id")
+    bg.add_argument("alias")
+    up = sub.add_parser("groupify", help="将已绑定的旧进度表移入共享项目组并补齐文档列")
+    up.add_argument("--name", help="项目组目录名称，默认使用表格别名")
     pub = sub.add_parser("publish", help="发布 AI 整理后的草稿 JSON")
     pub.add_argument("draft_file")
     pub.add_argument("--check", action="store_true", help="只校验草稿与共享范围重叠，不发布")
+    mdpub = sub.add_parser("publish-md", help="根据本地 .md 或腾讯文档来源发布 AI 拆分后的草稿")
+    mdpub.add_argument("source")
+    mdpub.add_argument("draft_file")
+    mdpub.add_argument("--check", action="store_true")
     queue = sub.add_parser("queue", help="精简队列；完整需求与证据使用 show/review")
     queue.add_argument("--app", action="append", help="按应用筛选，可重复；同时包含 apps 为 * 的共享事项")
     queue.add_argument("--limit", type=int, default=20, help="本次最多显示条数，默认 20，上限 100")
@@ -61,6 +71,20 @@ def parser():
     preflight.add_argument("--plan", help='批量 JSON：{"plans": [{"record_id": "…", "paths": ["…"]}]}')
     show = sub.add_parser("show", help="查看工单内容和需求指纹")
     show.add_argument("record_id")
+    migrate = sub.add_parser("migrate-document", help="旧工单再次处理时创建关联文档")
+    migrate.add_argument("record_id")
+    agreement = sub.add_parser("sync-agreement", help="明确决定写入文档后同步当前约定的需求版本")
+    agreement.add_argument("record_id")
+    agreement.add_argument("--delivery-file", help="重新核对后的交付与逐项验收 JSON；新工单需求变化时必填")
+    update = sub.add_parser("update-agreement", help="更新文档顶部当前约定并同步版本")
+    update.add_argument("record_id")
+    update.add_argument("text_file")
+    update.add_argument("--expected-hash", required=True)
+    update.add_argument("--delivery-file", help="重新核对后的交付与逐项验收 JSON；新工单需求变化时必填")
+    note = sub.add_parser("note", help="向工单文档追加对话，不改变需求版本或进度")
+    note.add_argument("record_id")
+    note.add_argument("text_file")
+    note.add_argument("--event-id")
     start = sub.add_parser("start", help="开始单条任务；成功后才允许编辑代码")
     start.add_argument("record_id")
     start.add_argument("--paths", nargs="+", required=True)
@@ -141,16 +165,21 @@ def _execute(args):
             return {"identity": identity, "role": state.data["identities"].get(identity["profile"], {}).get("role"),
                     "git": {"root": str(git.root), "head": git.head()}, "live_identity_verified": True}
         if args.command == "create":
-            return create(client, state, identity, args.name, args.alias or args.name, args.roles)
+            return create_group(client, state, identity, args.name, args.alias or args.name, args.roles)
         if args.command == "bind":
             return {"bound": bind(client, state, identity, args.url, args.alias, args.repair)}
+        if args.command == "bind-group":
+            return bind_group(client, state, identity, args.folder_id, args.alias)
         binding = state.select(args.table)
         if binding.get("provider") != "tencent":
             raise HandoffError("legacy_binding", "此绑定尚未迁移到腾讯文档，请绑定腾讯智能表；旧表不会被删除。")
         if args.command == "access":
             access = client.call("manage.get_privilege", {"file_id": binding["base_id"]})
-            return {"url": binding["url"], "policy": access.get("policy"),
-                    "next": "在腾讯文档分享面板将指定同事添加为可编辑；请勿共享 Token。"}
+            group = client.call("manage.get_privilege", {"file_id": binding["group_id"]}) if binding.get("group_id") else None
+            return {"url": binding["url"], "policy": access.get("policy"), "group_policy": group.get("policy") if group else None,
+                    "next": "所有者在分享面板添加指定成员；每位成员用本人账号 bind-group 核对访问。"}
+        if args.command == "groupify":
+            return groupify(client, state, identity, binding, args.name)
         if args.command == "layout":
             from tencent_layout import clean_layout
             return clean_layout(client, binding)
@@ -163,7 +192,8 @@ def _execute(args):
         current = [r for r in roster if r["账号ID"] == identity["user_id"]]
         if len(current) != 1:
             raise HandoffError("join_required", "请先用本人账号 join 登记为共享成员；分工可选。")
-        flow = Workflow(git, state, identity, binding, tickets, logs, members)
+        flow = Workflow(git, state, identity, binding, tickets, logs, members,
+                        documents=Documents(client) if binding.get("group_id") else None)
         command = args.command
         if command == "_auto-accept-step":
             from auto_accept import step
@@ -181,6 +211,15 @@ def _execute(args):
             return flow.queue(args.app, args.limit, args.offset)
         if command == "show":
             return flow.show(args.record_id)
+        if command == "migrate-document":
+            return flow.migrate_document(args.record_id)
+        if command == "sync-agreement":
+            return flow.sync_agreement(args.record_id, read_json(args.delivery_file) if args.delivery_file else None)
+        if command == "update-agreement":
+            return flow.update_agreement(args.record_id, args.expected_hash, Path(args.text_file).read_text(encoding="utf-8"),
+                                         read_json(args.delivery_file) if args.delivery_file else None)
+        if command == "note":
+            return flow.append_note(args.record_id, Path(args.text_file).read_text(encoding="utf-8"), args.event_id)
         if command == "preflight":
             if args.plan:
                 if args.record_id or args.paths or args.requirement:
@@ -202,6 +241,11 @@ def _execute(args):
             return flow.assign(args.record_id, {"user_id": args.user_id}, args.requirement)
         if command == "publish":
             return flow.publish(read_json(args.draft_file), args.check)
+        if command == "publish-md":
+            draft = read_json(args.draft_file)
+            if not isinstance(draft, dict):
+                raise HandoffError("invalid_draft", "Markdown 发布草稿须是 JSON 对象。")
+            return flow.publish({**draft, "mode": "markdown", "source": args.source}, args.check)
         if command == "start":
             return flow.start(args.record_id, args.paths, args.requirement)
         if command == "extend":
