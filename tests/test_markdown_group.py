@@ -146,6 +146,7 @@ class MarkdownGroupTests(RepositoryCase):
         self.assertEqual(self.fflow.show(rid)["document"]["agreement_current"], True)
         verified = bind_group(self.frontend, self.fstate, self.fwho, self.binding["group_id"], "项目")
         self.assertTrue(verified["document_readable"])
+        self.assertEqual(verified["documents_checked"], 1)
         sheet = self.world.sheets[self.binding["table_id"]]
         view = json.loads(sheet["view"]["config"])
         shown = {field["field_title"] for field in sheet["fields"] if not view["fieldMetas"][field["field_id"]]["hidden"]}
@@ -156,6 +157,21 @@ class MarkdownGroupTests(RepositoryCase):
         file_id = self.bflow.tickets.get(rid)["_文档ID"]
         self.world.folders[self.binding["group_id"]]["children"].remove(file_id)
         with self.assertRaisesRegex(HandoffError, "不在项目组目录"):
+            bind_group(self.frontend, self.fstate, self.fwho, self.binding["group_id"], "项目")
+
+    def test_group_bind_checks_later_documents(self):
+        self.publish()
+        self.bflow.tickets.create_once("_工单键", "second-ticket", {"标题": "第二单", "状态": "待对接",
+            "_文档ID": "document-outside", "文档": doc_url("document-outside")})
+        with self.assertRaisesRegex(HandoffError, "不在项目组目录"):
+            bind_group(self.frontend, self.fstate, self.fwho, self.binding["group_id"], "项目")
+
+    def test_group_bind_rejects_document_reuse(self):
+        rid = self.publish()
+        doc_id = self.bflow.tickets.get(rid)["_文档ID"]
+        self.bflow.tickets.create_once("_工单键", "second-ticket", {"标题": "第二单", "状态": "待对接",
+            "_文档ID": doc_id, "文档": doc_url(doc_id)})
+        with self.assertRaisesRegex(HandoffError, "同一份文档"):
             bind_group(self.frontend, self.fstate, self.fwho, self.binding["group_id"], "项目")
 
     def test_dialogue_does_not_change_requirement_but_agreement_does(self):

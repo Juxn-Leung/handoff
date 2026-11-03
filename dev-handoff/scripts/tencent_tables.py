@@ -498,17 +498,20 @@ def bind_group(client, state, who, folder_id, alias):
         raise HandoffError("group_table_ambiguous", "项目组目录须有且只有一张进度智能表。")
     binding = bind(client, state, who, candidates[0]["file_id"], alias, group_id=folder_id, group_url=meta.get("url"))
     # Check the actual document, if one exists; an empty group cannot yet prove document inheritance.
-    linked = []
+    linked, document_ids = [], set()
     tickets, _, _ = tables(client, binding, who)
     for row in tickets.records():
         if row.get("_文档ID"):
+            if row["_文档ID"] in document_ids:
+                raise HandoffError("document_reused", "不同工单关联了同一份文档，须先核对一行一文档。",
+                                   record_id=row["id"], document_id=row["_文档ID"])
+            document_ids.add(row["_文档ID"])
             if row["_文档ID"] not in child_ids:
                 raise HandoffError("document_outside_group", "工单关联文档不在项目组目录中。", record_id=row["id"])
             docs.agreement(row["_文档ID"])
             linked.append(row["id"])
-            break
     return {"bound": binding, "folder_readable": True, "table_readable": True,
-            "document_readable": bool(linked), "document_check_pending": not bool(linked),
+            "document_readable": bool(linked), "documents_checked": len(linked), "document_check_pending": not bool(linked),
             "checked_account": who["user_id"], "cross_account_verified": False,
             "next": "首次发布工单后，由另一账号再检查关联文档。" if not linked else
                     "当前账号已读到目录、表格和工单文档；请与创建账号核对身份，不能把同账号回读算作双账号验证。"}
