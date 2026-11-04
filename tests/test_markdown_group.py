@@ -181,6 +181,16 @@ class MarkdownGroupTests(RepositoryCase):
         joined = bind_link_group(self.frontend, self.fstate, self.fwho, self.binding["url"], "项目")
         self.assertEqual(joined["documents_checked"], 1)
         self.assertEqual(joined["entry_url"], self.binding["url"])
+        original = self.frontend.call
+        def fail_document_policy(name, args, write=False):
+            if name == "manage.get_privilege" and args["file_id"] == row["_文档ID"]:
+                raise HandoffError("mcp_rpc_error", "腾讯文档 MCP 返回错误。", rpc_code=-32603)
+            return original(name, args, write=write)
+        self.frontend.call = fail_document_policy
+        with self.assertRaises(HandoffError) as failed:
+            bind_link_group(self.frontend, self.fstate, self.fwho, self.binding["url"], "项目")
+        self.assertEqual(failed.exception.details["step"], "document_policy")
+        self.assertEqual(failed.exception.details["resource_id"], row["_文档ID"])
 
     def test_link_group_share_timeout_reuses_document_before_creating_row(self):
         self.world.policies[self.binding["base_id"]] = 3

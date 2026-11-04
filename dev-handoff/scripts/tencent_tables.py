@@ -556,16 +556,25 @@ def bind_group(client, state, who, folder_id, alias):
 def bind_link_group(client, state, who, table_url, alias):
     """Bind a document group through its shared SmartSheet, without folder access."""
     from tencent_documents import Documents, _doc_id
-    base, url = resolve_file(client, table_url)
-    policy = client.call("manage.get_privilege", {"file_id": base}).get("policy")
+    def at(step, resource_id, operation):
+        try:
+            return operation()
+        except HandoffError as exc:
+            raise HandoffError(exc.code, exc.message,
+                               **{**exc.details, "step": step, "resource_id": resource_id,
+                                  "next": "先用当前账号在网页打开该表格或文档；网页也打不开时核对文件链接权限，网页可打开而 MCP 失败则记录接口错误。"}) from None
+
+    base, url = at("table_info", table_url, lambda: resolve_file(client, table_url))
+    policy = at("table_policy", base, lambda: client.call("manage.get_privilege", {"file_id": base})).get("policy")
     if policy != 3:
         raise HandoffError("link_edit_required", "进度表尚未确认设置为持链接者可编辑；未接入链接组。",
                            table_url=url, policy=policy)
-    binding = bind(client, state, who, base, alias, group_id="link:" + base, group_url=url)
-    tickets, _, _ = tables(client, binding, who)
+    binding = at("table_bind", base,
+                 lambda: bind(client, state, who, base, alias, group_id="link:" + base, group_url=url))
+    tickets, _, _ = at("table_schema", base, lambda: tables(client, binding, who))
     docs = Documents(client)
     checked, seen = [], set()
-    for row in tickets.records():
+    for row in at("ticket_rows", base, lambda: tickets.records()):
         file_id = row.get("_文档ID")
         if not file_id:
             continue
@@ -573,13 +582,14 @@ def bind_link_group(client, state, who, table_url, alias):
             raise HandoffError("document_reused", "不同工单关联了同一份文档，须先核对一行一文档。",
                                record_id=row["id"], document_id=file_id)
         seen.add(file_id)
-        if _doc_id(row.get("文档") or "") != file_id:
+        if at("document_link", file_id, lambda: _doc_id(row.get("文档") or "")) != file_id:
             raise HandoffError("document_link_changed", "工单文档链接与文档 ID 不一致。", record_id=row["id"])
-        document_policy = client.call("manage.get_privilege", {"file_id": file_id}).get("policy")
+        document_policy = at("document_policy", file_id,
+                             lambda: client.call("manage.get_privilege", {"file_id": file_id})).get("policy")
         if document_policy != 3:
             raise HandoffError("document_link_edit_required", "关联工单文档尚未确认持链接者可编辑。",
                                record_id=row["id"], document_id=file_id, policy=document_policy)
-        docs.agreement(file_id)
+        at("ticket_document", file_id, lambda: docs.agreement(file_id))
         checked.append(row["id"])
     return {"bound": binding, "table_readable": True, "document_readable": bool(checked),
             "documents_checked": len(checked), "document_check_pending": not bool(checked),
