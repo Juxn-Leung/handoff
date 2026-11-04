@@ -9,7 +9,7 @@ import sys
 
 from handoff_core import Git, HandoffError, State, exclusive_lock, read_json
 from tencent_mcp import TencentMCP, load_token, prepare_directory
-from tencent_tables import identity as live_identity, bind, create_group, bind_group, groupify, tables, join
+from tencent_tables import identity as live_identity, bind, create_group, bind_group, bind_link_group, groupify, tables, join
 from tencent_documents import Documents
 from workflow import Workflow
 
@@ -51,6 +51,9 @@ def parser():
     bg = sub.add_parser("bind-group", help="以共享项目组目录链接或 ID 接入进度表并核对文档权限")
     bg.add_argument("folder_id")
     bg.add_argument("alias")
+    blg = sub.add_parser("bind-link-group", help="仅用持链接者可编辑的进度表链接接入文档项目组")
+    blg.add_argument("table_url")
+    blg.add_argument("alias")
     up = sub.add_parser("groupify", help="将已绑定的旧进度表移入共享项目组并补齐文档列")
     up.add_argument("--name", help="项目组目录名称，默认使用表格别名")
     pub = sub.add_parser("publish", help="发布 AI 整理后的草稿 JSON")
@@ -170,14 +173,16 @@ def _execute(args):
             return {"bound": bind(client, state, identity, args.url, args.alias, args.repair)}
         if args.command == "bind-group":
             return bind_group(client, state, identity, args.folder_id, args.alias)
+        if args.command == "bind-link-group":
+            return bind_link_group(client, state, identity, args.table_url, args.alias)
         binding = state.select(args.table)
         if binding.get("provider") != "tencent":
             raise HandoffError("legacy_binding", "此绑定尚未迁移到腾讯文档，请绑定腾讯智能表；旧表不会被删除。")
         if args.command == "access":
             access = client.call("manage.get_privilege", {"file_id": binding["base_id"]})
-            group = client.call("manage.get_privilege", {"file_id": binding["group_id"]}) if binding.get("group_id") else None
+            group = client.call("manage.get_privilege", {"file_id": binding["group_id"]}) if binding.get("group_id") and not binding["group_id"].startswith("link:") else None
             return {"url": binding["url"], "policy": access.get("policy"), "group_policy": group.get("policy") if group else None,
-                    "next": "所有者在分享面板添加指定成员；每位成员用本人账号 bind-group 核对访问。"}
+                    "next": "链接组须逐份核对表格与文档的链接编辑权限；目录组须由所有者分享给指定成员。"}
         if args.command == "groupify":
             return groupify(client, state, identity, binding, args.name)
         if args.command == "layout":

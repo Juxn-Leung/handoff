@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev-handoff/scripts"))
 from handoff_core import Git, State, HandoffError, requirement
 from delivery import contract
-from tencent_tables import create_group, bind_group, groupify, create, tables, join, identity
+from tencent_tables import create_group, bind_group, bind_link_group, groupify, create, tables, join, identity
 from tencent_documents import Documents
 from workflow import Workflow
 from test_handoff import RepositoryCase
@@ -21,6 +21,8 @@ class GroupWorld(World):
         super().__init__()
         self.folders = {}
         self.docs = {}
+        self.policies = {}
+        self.fail_share_before_commit = False
         self.fail_append_after_commit = False
         self.fail_append_before_commit = False
 
@@ -42,7 +44,7 @@ class GroupClient(Client):
         if name == "manage.create_file" and args["file_type"] == "smartcanvas":
             file_id = "document-" + str(len(w.docs) + 1)
             w.docs[file_id] = {"title": args["title"], "page": False, "agreement": "", "notes": []}
-            w.folders[args["parent_id"]]["children"].append(file_id)
+            w.folders.setdefault(args["parent_id"], {"title": "", "children": []})["children"].append(file_id)
             return {"file_id": file_id, "url": doc_url(file_id)}
         if name == "manage.create_file" and args["file_type"] == "smartsheet":
             result = super().call(name, args, write=write)
@@ -58,9 +60,17 @@ class GroupClient(Client):
                 return {"file_id": file_id, "type": "smartcanvas", "is_folder": False,
                         "url": doc_url(file_id)}
         if name == "manage.folder_list":
-            children = w.folders[args["folder_id"]]["children"]
+            children = w.folders.setdefault(args["folder_id"], {"title": "", "children": []})["children"]
             return {"list": [{"id": file_id, "title": w.docs[file_id]["title"] if file_id in w.docs else "项目进度",
                               "is_folder": False} for file_id in children[args.get("start", 0):]], "finish": True}
+        if name == "manage.get_privilege":
+            return {"policy": w.policies.get(args["file_id"], 0)}
+        if name == "manage.set_privilege":
+            if w.fail_share_before_commit:
+                w.fail_share_before_commit = False
+                raise HandoffError("write_unknown", "share response lost before commit")
+            w.policies[args["file_id"]] = args["policy"]
+            return {"policy": args["policy"]}
         if name == "manage.move_file":
             w.folders[args["target_folder_id"]]["children"].append(args["file_id"])
             return {}
@@ -151,6 +161,41 @@ class MarkdownGroupTests(RepositoryCase):
         view = json.loads(sheet["view"]["config"])
         shown = {field["field_title"] for field in sheet["fields"] if not view["fieldMetas"][field["field_id"]]["hidden"]}
         self.assertEqual(shown, {"标题", "状态", "跟进人", "下一步", "文档"})
+
+    def test_link_group_uses_table_entry_and_shares_each_new_document(self):
+        original_folder = self.binding["group_id"]
+        with self.assertRaises(HandoffError) as blocked:
+            bind_link_group(self.backend, self.state, self.bwho, self.binding["url"], "项目")
+        self.assertEqual(blocked.exception.code, "link_edit_required")
+        self.world.policies[self.binding["base_id"]] = 3
+        owner = bind_link_group(self.backend, self.state, self.bwho, self.binding["url"], "项目")
+        self.assertTrue(owner["document_check_pending"])
+        self.binding = owner["bound"]
+        bt, bl, bm = tables(self.backend, self.binding, self.bwho)
+        self.bflow = Workflow(self.git, self.state, self.bwho, self.binding, bt, bl, bm, Documents(self.backend))
+        rid = self.publish()
+        row = self.bflow.tickets.get(rid)
+        self.assertEqual(self.world.policies[row["_文档ID"]], 3)
+        self.assertIn(row["_文档ID"], self.world.folders[""]["children"])
+        self.assertNotIn(row["_文档ID"], self.world.folders[original_folder]["children"])
+        joined = bind_link_group(self.frontend, self.fstate, self.fwho, self.binding["url"], "项目")
+        self.assertEqual(joined["documents_checked"], 1)
+        self.assertEqual(joined["entry_url"], self.binding["url"])
+
+    def test_link_group_share_timeout_reuses_document_before_creating_row(self):
+        self.world.policies[self.binding["base_id"]] = 3
+        self.binding = bind_link_group(self.backend, self.state, self.bwho, self.binding["url"], "项目")["bound"]
+        bt, bl, bm = tables(self.backend, self.binding, self.bwho)
+        self.bflow = Workflow(self.git, self.state, self.bwho, self.binding, bt, bl, bm, Documents(self.backend))
+        self.world.fail_share_before_commit = True
+        with self.assertRaises(HandoffError) as failed:
+            self.publish()
+        self.assertEqual(failed.exception.code, "document_share_unknown")
+        self.assertEqual(len(self.world.docs), 1)
+        self.assertFalse(self.bflow.tickets.records())
+        self.bflow.publish(self.published_draft)
+        self.assertEqual(len(self.world.docs), 1)
+        self.assertEqual(len(self.bflow.tickets.records()), 1)
 
     def test_group_bind_error_identifies_failed_resource(self):
         original = self.frontend.call

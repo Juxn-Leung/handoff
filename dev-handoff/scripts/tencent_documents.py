@@ -119,10 +119,15 @@ class Documents:
             raise HandoffError("invalid_agreement", "每条工单须有非空的当前约定。")
         mode = self.require_capabilities()
         stable_title = (title[:23].rstrip() + " · " + digest(key)[:8])[:36]
-        found = [item for item in self.folder_items(folder_id) if item.get("title") == stable_title]
+        link_mode = isinstance(folder_id, str) and folder_id.startswith("link:")
+        target_folder = "" if link_mode else folder_id
+        found = [item for item in self.folder_items(target_folder) if item.get("title") == stable_title]
         if mode == "blocks":
-            return self._create_blocks(folder_id, stable_title, key, agreement, initial_text, actor, source_ref,
-                                       found, uncertain)
+            result = self._create_blocks(target_folder, stable_title, key, agreement, initial_text, actor, source_ref,
+                                         found, uncertain, link_mode=link_mode)
+            if link_mode:
+                self.ensure_link_edit(result["file_id"])
+            return result
         if len(found) > 1:
             raise HandoffError("document_ambiguous", "项目组中存在重复工单文档标题。")
         if found:
@@ -134,7 +139,7 @@ class Documents:
             if uncertain:
                 raise HandoffError("document_create_unknown", "先前创建结果仍未在目录中出现；已停止自动重建，避免重复文档。")
             try:
-                meta = self.client.call("manage.create_file", {"title": stable_title, "file_type": "smartcanvas", "parent_id": folder_id}, write=True)
+                meta = self.client.call("manage.create_file", {"title": stable_title, "file_type": "smartcanvas", "parent_id": target_folder}, write=True)
             except HandoffError as exc:
                 if exc.code == "write_unknown":
                     raise HandoffError("document_create_unknown", "创建文档结果未知；请重试，系统会先按稳定标题回读。") from None
@@ -149,9 +154,26 @@ class Documents:
         url = meta.get("url") or self.client.call("manage.query_file_info", {"file_id": file_id}).get("url")
         if not isinstance(url, str) or not url.startswith("https://docs.qq.com/"):
             raise HandoffError("document_url_missing", "文档已创建，但未回读到可访问链接。")
+        if link_mode:
+            self.ensure_link_edit(file_id)
         return {"file_id": file_id, "url": url, "agreement_hash": digest(agreement.strip())}
 
-    def _create_blocks(self, folder_id, stable_title, key, agreement, initial_text, actor, source_ref, found, uncertain):
+    def ensure_link_edit(self, file_id):
+        policy = self.client.call("manage.get_privilege", {"file_id": file_id}).get("policy")
+        if policy == 3:
+            return
+        if policy not in (0, 1, 2):
+            raise HandoffError("document_policy_unknown", "未读到工单文档的有效分享策略；未写入表格记录。")
+        try:
+            self.client.call("manage.set_privilege", {"file_id": file_id, "policy": 3}, write=True)
+        except HandoffError as exc:
+            if exc.code != "write_unknown":
+                raise
+        if self.client.call("manage.get_privilege", {"file_id": file_id}).get("policy") != 3:
+            raise HandoffError("document_share_unknown", "工单文档的链接编辑权限未通过回读确认；未写入表格记录。")
+
+    def _create_blocks(self, folder_id, stable_title, key, agreement, initial_text, actor, source_ref, found, uncertain,
+                       link_mode=False):
         if len(found) > 1:
             raise HandoffError("document_ambiguous", "项目组中存在重复工单文档标题。")
         if found:
@@ -183,7 +205,8 @@ class Documents:
                 if not file_id:
                     raise HandoffError("document_create_unknown", "创建文档未返回 ID；请先回读首页。")
             try:
-                self.client.call("manage.move_file", {"file_id": file_id, "target_folder_id": folder_id}, write=True)
+                if not link_mode:
+                    self.client.call("manage.move_file", {"file_id": file_id, "target_folder_id": folder_id}, write=True)
             except HandoffError as exc:
                 if exc.code != "write_unknown":
                     raise

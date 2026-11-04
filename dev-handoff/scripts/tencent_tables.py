@@ -553,6 +553,40 @@ def bind_group(client, state, who, folder_id, alias):
                     "当前账号已读到目录、表格和工单文档；请与创建账号核对身份，不能把同账号回读算作双账号验证。"}
 
 
+def bind_link_group(client, state, who, table_url, alias):
+    """Bind a document group through its shared SmartSheet, without folder access."""
+    from tencent_documents import Documents, _doc_id
+    base, url = resolve_file(client, table_url)
+    policy = client.call("manage.get_privilege", {"file_id": base}).get("policy")
+    if policy != 3:
+        raise HandoffError("link_edit_required", "进度表尚未确认设置为持链接者可编辑；未接入链接组。",
+                           table_url=url, policy=policy)
+    binding = bind(client, state, who, base, alias, group_id="link:" + base, group_url=url)
+    tickets, _, _ = tables(client, binding, who)
+    docs = Documents(client)
+    checked, seen = [], set()
+    for row in tickets.records():
+        file_id = row.get("_文档ID")
+        if not file_id:
+            continue
+        if file_id in seen:
+            raise HandoffError("document_reused", "不同工单关联了同一份文档，须先核对一行一文档。",
+                               record_id=row["id"], document_id=file_id)
+        seen.add(file_id)
+        if _doc_id(row.get("文档") or "") != file_id:
+            raise HandoffError("document_link_changed", "工单文档链接与文档 ID 不一致。", record_id=row["id"])
+        document_policy = client.call("manage.get_privilege", {"file_id": file_id}).get("policy")
+        if document_policy != 3:
+            raise HandoffError("document_link_edit_required", "关联工单文档尚未确认持链接者可编辑。",
+                               record_id=row["id"], document_id=file_id, policy=document_policy)
+        docs.agreement(file_id)
+        checked.append(row["id"])
+    return {"bound": binding, "table_readable": True, "document_readable": bool(checked),
+            "documents_checked": len(checked), "document_check_pending": not bool(checked),
+            "checked_account": who["user_id"], "cross_account_verified": False,
+            "entry_url": url, "next": "请由另一真实账号用自己的授权再接入并编辑测试记录。"}
+
+
 def groupify(client, state, who, binding, name=None):
     """Gradually upgrade an existing shared sheet without replacing its records."""
     if binding.get("group_id"):
