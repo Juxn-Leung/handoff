@@ -282,6 +282,9 @@ class Documents:
         parts = []
         for block in selected:
             body = html.unescape(block.group(3) or "").strip().replace("\u2028", "\n")
+            # SmartCanvas exports literal Markdown punctuation escaped in MDX.
+            # Compare the document text, not serialization escapes (e.g. empty\_text).
+            body = re.sub(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])", r"\1", body)
             if block.group(1) == "BulletedList":
                 body = "- " + body
             elif block.group(1) == "NumberedList":

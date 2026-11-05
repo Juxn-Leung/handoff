@@ -586,6 +586,23 @@ class BlockClient:
 
 
 class CurrentBlockApiTests(unittest.TestCase):
+    def test_live_mdx_escapes_do_not_change_requirement_text_or_fingerprint(self):
+        class Escaped(BlockClient):
+            def call(self, name, args, write=False):
+                value = super().call(name, args, write=write)
+                if name == "smartcanvas.read":
+                    doc = self.docs[args["file_id"]]
+                    # Real readback escapes literal underscores and backslashes.
+                    exported = doc["agreement"].replace("\\", "\\\\").replace("_", "\\_")
+                    value["content"] = value["content"].replace(doc["agreement"], exported, 1)
+                return value
+        docs = Documents(Escaped())
+        text = "交付 empty_text 与 error_text；字面路径 C:\\new\\file。"
+        created = docs.create("group", "字段约定", "escaped-fields", text, "本单来源", "成员")
+        self.assertEqual(docs.agreement(created["file_id"])["text"], text)
+        updated = docs.update_agreement(created["file_id"], created["agreement_hash"], "empty_text 必须为暂无订单")
+        self.assertEqual(updated["text"], "empty_text 必须为暂无订单")
+
     def test_legacy_heading_remains_readable_and_editable(self):
         client = BlockClient()
         docs = Documents(client)
