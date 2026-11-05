@@ -293,7 +293,7 @@ class Workflow:
         self.state.save()
 
     def _apply(self, row, patch, title, message, session=None, set_last=False, acceptance_binding=None,
-               allow_requirement_change=False):
+               allow_requirement_change=False, document_message=None):
         self._guard_clean()
         if not allow_requirement_change:
             self._document_guard(row)
@@ -319,7 +319,7 @@ class Workflow:
             file_id = patch.get("_文档ID") or row.get("_文档ID")
             if file_id:
                 op["document_event"] = {"file_id": file_id, "actor": self.identity["name"],
-                                        "message": f"**{title}**\n\n{message}"}
+                                        "message": f"**{title}**\n\n{document_message if document_message is not None else message}"}
         if acceptance_binding:
             op["acceptance_binding"] = acceptance_binding
         if allow_requirement_change:
@@ -540,8 +540,9 @@ class Workflow:
             for field in ("title", "description", "agreement"):
                 if not isinstance(draft.get(field), str) or not draft[field].strip():
                     raise HandoffError("invalid_draft", "Markdown 工单缺少非空 " + field + "。", key=key)
-            if len(drafts) > 1 and not isinstance(draft.get("excerpt"), str):
-                raise HandoffError("invalid_draft", "一份长文档拆成多单时，每单须给出对应摘录。", key=key)
+            if (len(drafts) > 1 or "excerpt" in draft) and (
+                    not isinstance(draft.get("excerpt"), str) or not draft["excerpt"].strip()):
+                raise HandoffError("invalid_draft", "每单的对应摘录须非空，不能将整份多事项来源放入同一对话页。", key=key)
             if draft.get("critical_unknowns"):
                 raise HandoffError("needs_clarification", "关键约定尚未明确，暂不发布。", key=key, questions=draft["critical_unknowns"])
             types = draft.get("change_types") or ["change"]
@@ -822,7 +823,21 @@ class Workflow:
                    "auto_accept": bool(delivery and auto_accept)}
         patch = {"状态": "待验收", "处理结果": result["summary"] + "\n\n验证：\n" + json.dumps(checks, ensure_ascii=False, indent=2),
                  "结果版本": version, "_结果证据": json.dumps(evidence, ensure_ascii=False)}
-        self._apply(row, patch, "提交待验收", "结果版本：" + version + "\n" + patch["处理结果"], session=session, set_last=True)
+        labels = {c["id"]: c["description"] for c in (contract(row) or {}).get("checks", [])}
+        kinds = {"local": "本地检查", "mock": "模拟检查", "integration": "集成检查", "manual": "人工检查"}
+        lines = [result["summary"], "验证结果："]
+        for check in checks:
+            label = labels.get(str(check.get("id")), check["command"])
+            outcome = "通过" if check["outcome"] == "passed" else f"未执行：{check['reason']}"
+            lines.append(f"- {label}（{kinds.get(str(check.get('kind')), '检查')}）：{outcome}")
+        if delivery:
+            for item in acceptance_matrix(delivery, evidence):
+                lines.append(f"{item['description']}：{item['actual']}")
+                for entry in item["evidence"]:
+                    lines.append("证据：" + entry["content"] + ("\n引用：" + entry["reference"] if entry.get("reference") else ""))
+        lines.append("下一步：请指定验收人按本次提交的标准检查。")
+        self._apply(row, patch, "提交待验收", "结果版本：" + version + "\n" + patch["处理结果"], session=session, set_last=True,
+                    document_message="\n\n".join(lines))
         return {"pending_acceptance": rid, "result_version": version, "stop": True,
                 "queue": self.queue(), "next": "等待操作者验收；只有明确说继续才可处理下一条。"}
 
@@ -848,7 +863,9 @@ class Workflow:
                 "observed": [{"id": r["id"], "state": r.get("状态"), "result_version": r.get("结果版本", "")} for r in observed]}
         message = f"原因：{reason}\n已尝试：{attempted}\n所需信息：{needed}\n\n" + json.dumps(note, ensure_ascii=False)
         self._apply(row, {"状态": "阻塞", "处理结果": json.dumps(note, ensure_ascii=False)}, "处理阻塞", message,
-                    session={**session, "phase": "blocked"}, set_last=True)
+                    session={**session, "phase": "blocked"}, set_last=True,
+                    document_message=f"原因：{reason}\n\n已尝试：{attempted}\n\n需要协助：{needed}"
+                    + ("\n\n等待事项：" + "、".join(waiting_for) if waiting_for else ""))
         return {"blocked": rid, "stop": True, "queue": self.queue()}
 
     def _shared_evidence(self, row, confirmed_version=None, allow_outdated=False):
@@ -929,6 +946,10 @@ class Workflow:
         if evidence["workspace"] == digest(str(self.git.root)):
             self._check_evidence(row)
         items = validate_confirmation(delivery, evidence, supplied, confirmed_version)
+        criteria = {c["id"]: c["description"] for c in delivery["criteria"]}
+        dialogue = "\n\n".join(["本次提交已逐项验收通过。"] + [
+            f"- {criteria[item['criterion_id']]}：{item['observed']}" for item in items
+        ] + ["下一步：等待原处理工作区复核并回写完成。"])
         existing = self._approval(row, evidence)
         key = self._confirmation_key(rid, confirmed_version, self.identity["user_id"])
         if existing:
@@ -937,7 +958,7 @@ class Workflow:
                 raise HandoffError("confirmation_changed", "本版本已有不可覆盖的确认；需要调整时先退回或提交新版本。")
             if self.binding.get("group_id") and row.get("下一步") != "等待原工作区复核并完成":
                 self._apply(row, {"下一步": "等待原工作区复核并完成"}, "验收确认",
-                            "指定验收人已确认结果版本：" + confirmed_version)
+                            "指定验收人已确认结果版本：" + confirmed_version, document_message=dialogue)
             return {"confirmed": rid, "result_version": confirmed_version, "already_confirmed": True,
                     "next": "仍待原处理账号在原工作区复核代码并 accept 回写。"}
         if digest(self.tickets.get(rid)) != digest(row):
@@ -959,7 +980,7 @@ class Workflow:
             raise
         if self.binding.get("group_id"):
             self._apply(row, {"下一步": "等待原工作区复核并完成"}, "验收确认",
-                        "指定验收人已确认结果版本：" + confirmed_version)
+                        "指定验收人已确认结果版本：" + confirmed_version, document_message=dialogue)
         return {"confirmed": rid, "result_version": confirmed_version, "reviewer_id": self.identity["user_id"],
                 "event_key": key, "stop": True, "next": "业务确认已记录；等待原工作区已启用的自动回写，或由原处理账号 accept。尚不能报告已完成。"}
 
@@ -1040,7 +1061,8 @@ class Workflow:
         reviewer = [{"userId": approval["reviewer_id"], "corpId": self.identity["corp_id"]}] if approval else self.person
         self._apply(row, {"状态": "已完成", "验收人": reviewer, "验收时间": approval["confirmed_at"] if approval else table_time(), "_执行标记": ""},
                     "验收通过", "原工作区复核并回写结果版本：" + confirmed_version + "\n确认记录：" + json.dumps(approval, ensure_ascii=False),
-                    session={**session, "phase": "completed"}, acceptance_binding=approval)
+                    session={**session, "phase": "completed"}, acceptance_binding=approval,
+                    document_message="验收已通过，原处理工作区已完成复核，本事项已完成。")
         return {"accepted": rid, "result_version": confirmed_version, "reviewer": reviewer, "stop": True}
 
     def reject(self, rid, reason, confirmed_version=None, criterion_ids=None):
@@ -1075,7 +1097,11 @@ class Workflow:
                                   "requirement_version": submitted["requirement"], "current_requirement_version": requirement(row), "actor_id": self.identity["user_id"],
                                   "criterion_ids": criterion_ids, "reason": reason, "affected": affected}, ensure_ascii=False)
         self._apply(row, {"状态": "待对接", "_执行标记": "", "验收人": [], "验收时间": None},
-                    "验收退回", message, session=session)
+                    "验收退回", message, session=session,
+                    document_message="退回原因：" + reason
+                    + ("\n\n需复查：" + "、".join(criterion_ids) if delivery else "")
+                    + ("\n\n受影响事项：" + "、".join(affected) if affected else "")
+                    + "\n\n下一步：在本页继续补充处理结果，修复后重新提交验收。")
         return {"returned": rid, "affected": affected, "stop": True}
 
     def resume(self, rid, reason):

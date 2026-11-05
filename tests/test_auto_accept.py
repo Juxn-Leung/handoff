@@ -239,7 +239,7 @@ class AutoAcceptTests(RepositoryCase):
         self.assertEqual(json.loads(result.stdout)["data"]["status"], "expired")
         self.assertEqual(State(self.git, self.state_dir).data["auto_accept"][self.job["id"]]["status"], "expired")
 
-    def test_cli_ready_defaults_to_auto_and_launches_after_releasing_operation_lock(self):
+    def test_cli_explicit_auto_launches_after_releasing_operation_lock(self):
         self.binding["provider"] = "tencent"
         self.state.save_project()
         self.ticket(来源=json.dumps({"delivery": self.acceptance_delivery("backend")}))
@@ -247,7 +247,7 @@ class AutoAcceptTests(RepositoryCase):
         result_file = Path(self.tmp.name) / "result.json"
         result_file.write_text(json.dumps(self.result()))
         args = handoff.parser().parse_args(["--repo", str(self.root), "--state-dir", str(self.state_dir),
-                                          "ready", "task-1", str(result_file)])
+                                          "ready", "task-1", str(result_file), "--auto-accept"])
         def launch(repo, state_dir, job):
             with exclusive_lock(self.state.lock_path):
                 self.assertEqual(job["profile"], FRONTEND["profile"])
@@ -262,7 +262,7 @@ class AutoAcceptTests(RepositoryCase):
         self.assertEqual(result["auto_accept_workers"], [{"worker": "running"}])
         self.assertTrue(State(self.git, self.state_dir).data["sessions"][self.flow.key("task-1")]["auto_accept"])
 
-    def test_cli_manual_ready_does_not_launch_and_status_needs_no_token(self):
+    def test_cli_default_ready_and_sync_do_not_launch_and_status_needs_no_token(self):
         self.binding["provider"] = "tencent"
         self.state.save_project()
         self.ticket(来源=json.dumps({"delivery": self.acceptance_delivery("backend")}))
@@ -273,7 +273,8 @@ class AutoAcceptTests(RepositoryCase):
         with patch("handoff.load_token", return_value="offline-fixture"), patch("handoff.TencentMCP"), \
              patch("handoff.live_identity", return_value=FRONTEND), \
              patch("handoff.tables", return_value=(self.tickets, self.logs, self.members)), patch("auto_accept.launch") as spawn:
-            handoff.execute(handoff.parser().parse_args([*prefix, "ready", "task-1", str(result_file), "--manual-accept"]))
+            handoff.execute(handoff.parser().parse_args([*prefix, "ready", "task-1", str(result_file)]))
+            handoff.execute(handoff.parser().parse_args([*prefix, "sync"]))
         spawn.assert_not_called()
         with patch("handoff.load_token", side_effect=AssertionError("status must be local")):
             self.assertEqual(handoff.execute(handoff.parser().parse_args([*prefix, "auto-accept", "--status"])), {"auto_accept": []})

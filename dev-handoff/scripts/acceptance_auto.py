@@ -146,7 +146,7 @@ def _prepare(repo, run_dir, table_url, reviewer_id):
             row = flow.tickets.get(row["id"])
             if row["状态"] == "处理中":
                 write_json(run_dir / "result.json", result(flow))
-                arguments = ["ready", row["id"], str(run_dir / "result.json")]
+                arguments = ["ready", row["id"], str(run_dir / "result.json"), "--auto-accept"]
             elif row["状态"] == "待验收" and flow.session(row["id"]).get("auto_accept"):
                 arguments = ["auto-accept"]
             else:

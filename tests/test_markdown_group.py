@@ -1,5 +1,6 @@
 """Markdown group flow across two account clients and a shared fake Tencent service."""
 import base64
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -11,6 +12,7 @@ from handoff_core import Git, State, HandoffError, requirement
 from delivery import contract
 from tencent_tables import create_group, bind_group, bind_link_group, groupify, create, tables, join, identity
 from tencent_documents import Documents
+from inbox import read as read_inbox
 from workflow import Workflow
 from test_handoff import RepositoryCase
 from test_tencent_workflow import Client, World
@@ -161,6 +163,147 @@ class MarkdownGroupTests(RepositoryCase):
         view = json.loads(sheet["view"]["config"])
         shown = {field["field_title"] for field in sheet["fields"] if not view["fieldMetas"][field["field_id"]]["hidden"]}
         self.assertEqual(shown, {"标题", "状态", "跟进人", "下一步", "文档"})
+
+    def test_inbox_keeps_publisher_and_reviewer_informed_without_remote_writes(self):
+        rid = self.publish()
+        writes = self.world.writes
+        first = read_inbox(self.bflow)
+        peer = read_inbox(self.fflow)
+        self.assertEqual(first["items"][0]["my_roles"], ["发布方"])
+        self.assertEqual(peer["items"][0]["my_roles"], ["验收人"])
+        self.assertEqual(first["items"][0]["update"], "first_read")
+        self.assertEqual(read_inbox(self.bflow)["items"][0]["update"], "unchanged")
+        self.assertEqual(self.world.writes, writes)
+        self.assertFalse(first["background_started"])
+        json.dumps(first)  # The CLI can serialize all account identifiers.
+        before = requirement(self.bflow.tickets.get(rid))
+        self.fflow.append_note(rid, "请补充失败重试的交互要求。", "question-inbox")
+        update = read_inbox(self.bflow)
+        self.assertEqual(update["items"][0]["update"], "changed")
+        self.assertIn("请补充失败重试", update["items"][0]["conversation_tail"])
+        self.assertEqual(before, requirement(self.bflow.tickets.get(rid)))
+        # Reading does not resolve a responsibility or remove the still-open topic.
+        again = read_inbox(self.bflow)
+        self.assertEqual(again["items"][0]["id"], rid)
+        self.assertEqual(again["items"][0]["status"], "待对接")
+
+    def test_inbox_cursors_are_scoped_to_actual_account_and_survive_new_session(self):
+        self.publish()
+        read_inbox(self.bflow)
+        # Both fake accounts deliberately have the same nickname.
+        self.assertEqual(self.bwho["name"], self.fwho["name"])
+        original = self.bflow.identity
+        self.bflow.identity = self.fwho
+        self.assertEqual(read_inbox(self.bflow)["items"][0]["update"], "first_read")
+        self.bflow.identity = original
+        self.bflow.state = State(self.git, self.state_dir)
+        self.assertEqual(read_inbox(self.bflow)["items"][0]["update"], "unchanged")
+
+    def test_unreadable_inbox_does_not_consume_update_or_report_empty(self):
+        rid = self.publish()
+        read_inbox(self.bflow)
+        self.fflow.append_note(rid, "补充了联调说明。", "inbox-recovery")
+        original = self.bflow.documents.content
+        def unavailable(file_id):
+            raise HandoffError("tencent_permission_denied", "暂时无法读取")
+        self.bflow.documents.content = unavailable
+        failed = read_inbox(self.bflow)
+        self.assertEqual(failed["unreadable"], 1)
+        self.assertEqual(failed["items"][0]["update"], "unreadable")
+        self.bflow.documents.content = original
+        self.assertEqual(read_inbox(self.bflow)["items"][0]["update"], "changed")
+
+    def test_inbox_pages_do_not_mark_unreturned_topics_as_observed(self):
+        self.publish()
+        draft = copy.deepcopy(self.published_draft)
+        draft["tickets"][0]["key"] = "second-inbox-topic"
+        self.bflow.publish(draft)
+        first = read_inbox(self.bflow, limit=1)
+        self.assertEqual(first["page"]["remaining"], 1)
+        self.assertEqual(first["page"]["next_offset"], 1)
+        second = read_inbox(self.bflow, limit=1, offset=1)
+        self.assertEqual(second["items"][0]["update"], "first_read")
+        self.assertNotEqual(first["items"][0]["id"], second["items"][0]["id"])
+
+    def test_inbox_explicit_topic_is_followed_but_unrelated_topics_are_not(self):
+        rid = self.publish()
+        original = self.bflow.identity
+        self.bflow.identity = {**original, "user_id": "third-person", "profile": "tencent:third-person"}
+        self.assertEqual(read_inbox(self.bflow)["items"], [])
+        self.assertEqual(read_inbox(self.bflow, record_id=rid)["items"][0]["id"], rid)
+        self.assertEqual(read_inbox(self.bflow)["items"][0]["update"], "unchanged")
+        self.bflow.identity = original
+
+    def test_independent_topics_keep_their_own_source_and_replies(self):
+        self.publish()
+        draft = copy.deepcopy(self.published_draft)
+        first = draft["tickets"][0]
+        first.update(key="topic-a", excerpt="事项甲独有的接口说明")
+        second = {**copy.deepcopy(first), "key": "topic-b", "title": "另一事项",
+                  "agreement": "另一项独立约定", "excerpt": "事项乙独有的接口说明"}
+        draft["tickets"] = [first, second]
+        published = self.bflow.publish(draft)["published"]
+        self.assertNotEqual(published[0]["document"], published[1]["document"])
+        a, b = [item["id"] for item in published]
+        self.bflow.append_note(a, "只追问甲的分页", "topic-a-reply")
+        content_a = self.bflow.show(a)["document"]["content"]
+        content_b = self.bflow.show(b)["document"]["content"]
+        self.assertIn(first["excerpt"], content_a)
+        self.assertNotIn(second["excerpt"], content_a)
+        self.assertIn(second["excerpt"], content_b)
+        self.assertNotIn(first["excerpt"], content_b)
+        self.assertNotIn("只追问甲的分页", content_b)
+        self.assertEqual(self.bflow.publish(draft)["published"], published)
+
+    def test_empty_excerpt_cannot_copy_all_topics_into_each_page(self):
+        self.publish()
+        draft = copy.deepcopy(self.published_draft)
+        first = draft["tickets"][0]
+        first.update(key="empty-excerpt", excerpt=" ")
+        draft["tickets"].append({**first, "key": "other-topic", "excerpt": "另一事项"})
+        count = len(self.world.docs)
+        with self.assertRaisesRegex(HandoffError, "摘录须非空"):
+            self.bflow.publish(draft)
+        self.assertEqual(len(self.world.docs), count)
+
+    def test_readable_replies_keep_audit_evidence_and_revisions_in_same_document(self):
+        rid = self.publish()
+        row = self.fflow.tickets.get(rid)
+        file_id = row["_文档ID"]
+        self.fflow.claim(rid, requirement(row))
+        self.fflow.start(rid, ["screen.js"], requirement(self.fflow.tickets.get(rid)))
+        self.fflow.block(rid, "等待测试环境", "检查连接", "提供环境地址")
+        blocked = self.fflow.show(rid)["document"]["content"]
+        self.assertIn("等待测试环境", blocked)
+        self.assertNotIn("handoff_block_v1", blocked)
+        self.assertEqual(json.loads(self.fflow.tickets.get(rid)["处理结果"])["type"], "handoff_block_v1")
+        self.fflow.resume(rid, "测试环境已可用")
+        self.fflow.start(rid, ["screen.js"], requirement(self.fflow.tickets.get(rid)))
+        (self.frontroot / "screen.js").write_text("fetch('/orders');\n")
+        first = self.fflow.ready(rid, self.result())["result_version"]
+        self.fflow.reject(rid, "需要补充空态检查", first, ["syntax-valid"])
+        rejected = self.fflow.show(rid)["document"]["content"]
+        self.assertIn("需要补充空态检查", rejected)
+        self.assertNotIn("acceptance_rejection_v1", rejected)
+        self.fflow.start(rid, ["screen.js"], requirement(self.fflow.tickets.get(rid)))
+        second = self.fflow.ready(rid, self.result())["result_version"]
+        self.assertNotEqual(first, second)
+        self.fflow.confirm(rid, second, self.confirmation(self.fflow, rid))
+        self.fflow.accept(rid, second)
+        row = self.fflow.tickets.get(rid)
+        content = self.fflow.show(rid)["document"]["content"]
+        self.assertEqual(row["_文档ID"], file_id)
+        self.assertEqual(len(self.world.docs), 1)
+        self.assertEqual(row["状态"], "已完成")
+        self.assertIn(self.result()["summary"], content)
+        self.assertIn(self.result()["acceptance"][0]["evidence"][0]["content"], content)
+        self.assertNotIn(first, content)
+        self.assertNotIn(second, content)
+        self.assertEqual(json.loads(row["_结果证据"])["checks"], self.result()["checks"])
+        audit = "\n".join(log["内容"] for log in self.fflow.logs.records())
+        self.assertIn(first, audit)
+        self.assertIn(second, audit)
+        self.assertIn("acceptance_confirmation_v1", audit)
 
     def test_link_group_uses_table_entry_and_shares_each_new_document(self):
         original_folder = self.binding["group_id"]
@@ -408,8 +551,10 @@ class BlockClient:
                     "finish": True}
         if name == "create_smartcanvas_by_mdx":
             fid = "doc-" + str(len(self.docs) + 1)
-            agreement = args["mdx"].split("## 当前约定\n\n", 1)[1].split("\n\n---", 1)[0]
-            self.docs[fid] = {"title": args["title"], "agreement": agreement, "notes": args["mdx"], "id": "agreement-1"}
+            heading = args["mdx"].split("\n", 1)[0].removeprefix("## ")
+            agreement = args["mdx"].split("\n\n", 1)[1].split("\n\n---", 1)[0]
+            self.docs[fid] = {"title": args["title"], "heading": heading,
+                              "agreement": agreement, "notes": args["mdx"], "id": "agreement-1"}
             self.folders[""].append(fid)
             return {"file_id": fid}
         if name == "manage.move_file":
@@ -422,7 +567,7 @@ class BlockClient:
             return {"file_id": fid, "type": "smartcanvas", "url": doc_url(fid)}
         if name == "smartcanvas.read":
             doc = self.docs[args["file_id"]]
-            return {"content": (f'<Heading id="current">\n  当前约定\n</Heading>\n\n'
+            return {"content": (f'<Heading id="current">\n  {doc["heading"]}\n</Heading>\n\n'
                     f'<Paragraph id="{doc["id"]}">\n  {doc["agreement"]}\n</Paragraph>\n\n'
                     '<Divider id="divider" />\n\n<Heading id="dialogue">\n  来源与对话\n</Heading>\n\n'
                     + doc["notes"]), "next_token": ""}
@@ -441,6 +586,15 @@ class BlockClient:
 
 
 class CurrentBlockApiTests(unittest.TestCase):
+    def test_legacy_heading_remains_readable_and_editable(self):
+        client = BlockClient()
+        docs = Documents(client)
+        created = docs.create("group", "旧工单", "legacy", "旧约定", "资料", "成员")
+        client.docs[created["file_id"]]["heading"] = "当前约定"
+        current = docs.agreement(created["file_id"])
+        self.assertEqual(current["text"], "旧约定")
+        self.assertEqual(docs.update_agreement(created["file_id"], current["hash"], "新约定")["text"], "新约定")
+
     def test_paginated_read_drops_repeated_front_matter(self):
         class Pages:
             def __init__(self):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone, timedelta
 import html
 import json
 from pathlib import Path
@@ -11,7 +12,23 @@ from urllib.parse import urlparse
 from handoff_core import HandoffError, digest, table_time
 
 AGREEMENT_PAGE = "当前约定"
+AGREEMENT_HEADINGS = {AGREEMENT_PAGE, "事项描述"}
 EVENT_PREFIX = "[dev-handoff-event:"
+
+
+def dialogue_entry(actor, message, event_id, timestamp=None):
+    """One chronological reply; keep its recovery marker after the readable body."""
+    stamp = datetime.fromisoformat(timestamp or table_time()).astimezone(timezone(timedelta(hours=8)))
+    author = re.sub(r"([\\`*_{}\[\]<>])", r"\\\1", " ".join(actor.split()))
+    return (f"\n\n---\n\n**{author}** · {stamp:%Y-%m-%d %H:%M}（UTC+8）\n\n"
+            f"{message.strip()}\n\n{EVENT_PREFIX}{event_id}]\n")
+
+
+def conversation_markdown(agreement, message, actor, event_id):
+    # Line separators keep the current agreement in one editable block.
+    current = agreement.strip().replace("\r\n", "\n").replace("\n", "\u2028")
+    return (f"## 事项描述\n\n{current}\n\n---\n\n## 沟通记录"
+            + dialogue_entry(actor, message, event_id))
 
 
 def _element(value):
@@ -148,7 +165,7 @@ class Documents:
             if not file_id:
                 raise HandoffError("document_create_unknown", "创建文档未返回 ID；请重试并先回读目录。")
         self.ensure_agreement(file_id, agreement, uncertain=uncertain)
-        note = (f"原始资料：{source_ref}\n\n" if source_ref else "") + initial_text
+        note = "**发布事项**\n\n" + ((f"相关资料：{source_ref}\n\n" if source_ref else "") + initial_text)
         if note.strip():
             self.append_once(file_id, "source-" + digest(key)[:16], actor, note, uncertain=uncertain)
         url = meta.get("url") or self.client.call("manage.query_file_info", {"file_id": file_id}).get("url")
@@ -188,11 +205,8 @@ class Documents:
                 if uncertain:
                     raise HandoffError("document_create_unknown", "先前创建结果仍未在首页或组内出现；已停止自动重建。")
                 event = "source-" + digest(key)[:16]
-                note = (f"原始资料：{source_ref}\n\n" if source_ref else "") + initial_text
-                # Line separators keep the current agreement in one editable block.
-                current = agreement.strip().replace("\r\n", "\n").replace("\n", "\u2028")
-                markdown = (f"## 当前约定\n\n{current}\n\n---\n\n## 来源与对话\n\n"
-                            f"### {table_time()} · {actor}\n\n{EVENT_PREFIX}{event}]\n\n{note}\n")
+                note = "**发布事项**\n\n" + ((f"相关资料：{source_ref}\n\n" if source_ref else "") + initial_text)
+                markdown = conversation_markdown(agreement, note, actor, event)
                 try:
                     created = self.client.call("create_smartcanvas_by_mdx",
                                                {"title": stable_title, "mdx": markdown, "content_format": "markdown"},
@@ -254,12 +268,13 @@ class Documents:
         blocks = list(re.finditer(r'<(Heading|Paragraph|BulletedList|NumberedList)\b[^>]*\bid="([^"]+)"[^>]*>\s*(.*?)\s*</\1>|<Divider\b[^>]*/>',
                                  mdx, re.S))
         start = next((i for i, block in enumerate(blocks)
-                      if block.group(1) == "Heading" and html.unescape(block.group(3) or "").strip() == AGREEMENT_PAGE), None)
+                      if block.group(1) == "Heading" and html.unescape(block.group(3) or "").strip() in AGREEMENT_HEADINGS), None)
         if start is None:
             raise HandoffError("agreement_unreadable", "文档顶部缺少当前约定标题。")
         selected = []
         for block in blocks[start + 1:]:
-            if block.group(1) is None or (block.group(1) == "Heading" and "对话" in (block.group(3) or "")):
+            if block.group(1) is None or (block.group(1) == "Heading" and any(
+                    label in (block.group(3) or "") for label in ("对话", "沟通记录"))):
                 break
             selected.append(block)
         if not selected:
@@ -379,7 +394,7 @@ class Documents:
             return {"already_present": True}
         if uncertain:
             raise HandoffError("document_append_unknown", "先前追加的结果仍未在文档中出现；已停止自动重发，避免重复对话。")
-        markdown = f"\n\n### {table_time()} · {actor}\n\n{marker}\n\n{message.strip()}\n"
+        markdown = dialogue_entry(actor, message, event_id)
         try:
             if self.require_capabilities() == "blocks":
                 self.client.call("smartcanvas.edit", {"file_id": file_id, "action": "INSERT_AFTER", "id": "",

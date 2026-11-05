@@ -67,6 +67,10 @@ def parser():
     queue.add_argument("--app", action="append", help="按应用筛选，可重复；同时包含 apps 为 * 的共享事项")
     queue.add_argument("--limit", type=int, default=20, help="本次最多显示条数，默认 20，上限 100")
     queue.add_argument("--offset", type=int, default=0, help="跳过筛选后的条数")
+    inbox = sub.add_parser("inbox", help="按需读取与本人相关的事项与对话更新；不启动后台、不回写远端")
+    inbox.add_argument("record_id", nargs="?", help="指定事项时只读取此项，并在本工作区继续关注")
+    inbox.add_argument("--limit", type=int, default=20)
+    inbox.add_argument("--offset", type=int, default=0)
     preflight = sub.add_parser("preflight", help="提前检查接手方文件；保存本地计划，不修改远端、不授权编辑")
     preflight.add_argument("record_id", nargs="?")
     preflight.add_argument("--paths", nargs="+")
@@ -99,7 +103,9 @@ def parser():
     ready.add_argument("record_id")
     ready.add_argument("result_file")
     ready.add_argument("--revalidate", action="store_true")
-    ready.add_argument("--manual-accept", action="store_true", help="本轮仅提交待验收，不启用确认后的本机自动回写")
+    ready_mode = ready.add_mutually_exclusive_group()
+    ready_mode.add_argument("--manual-accept", action="store_true", help="兼容旧入口；默认已为按需回写，不启动后台")
+    ready_mode.add_argument("--auto-accept", action="store_true", help="仅在明确要求后台自动回写时启用旧后台模式")
     auto = sub.add_parser("auto-accept", help="原工作区启用、恢复、查看或停止自动回写；省略 ID 时恢复已启用事项")
     auto.add_argument("record_id", nargs="?")
     mode = auto.add_mutually_exclusive_group()
@@ -200,6 +206,9 @@ def _execute(args):
         flow = Workflow(git, state, identity, binding, tickets, logs, members,
                         documents=Documents(client) if binding.get("group_id") else None)
         command = args.command
+        if command == "inbox":
+            from inbox import read
+            return read(flow, args.record_id, args.limit, args.offset)
         if command == "_auto-accept-step":
             from auto_accept import step
             return step(flow, args.job_id)
@@ -257,8 +266,8 @@ def _execute(args):
             return flow.extend(args.record_id, args.paths)
         if command == "ready":
             result = flow.ready(args.record_id, read_json(args.result_file), args.revalidate,
-                                auto_accept=not args.manual_accept)
-            return _schedule_auto_accept(flow, state_dir, result)
+                                auto_accept=args.auto_accept)
+            return _schedule_auto_accept(flow, state_dir, result) if args.auto_accept else result
         if command == "block":
             return flow.block(args.record_id, args.reason, args.attempted, args.needed,
                               args.kind, args.waiting_for, args.paths)
@@ -273,7 +282,7 @@ def _execute(args):
         if command == "resume":
             return flow.resume(args.record_id, args.reason)
         if command == "sync":
-            return _schedule_auto_accept(flow, state_dir, {"recovered": flow.sync()})
+            return {"recovered": flow.sync()}
         if command == "abandon-operation":
             return flow.abandon_operation(args.operation_id, args.reason)
         raise HandoffError("invalid_command", "未支持的操作。")
